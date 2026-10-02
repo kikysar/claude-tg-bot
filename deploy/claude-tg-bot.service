@@ -1,0 +1,36 @@
+[Unit]
+Description=Telegram-пульт для Claude Code
+Documentation=https://code.claude.com/docs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Непривилегированный пользователь: обход разрешений Claude Code под root запрещён,
+# и заодно у бота нет прав на системные файлы и чужие проекты.
+User=claudebot
+Group=claudebot
+Environment=HOME=/home/claudebot
+WorkingDirectory=/opt/claude-tg-bot
+EnvironmentFile=/etc/claude-tg-bot.env
+ExecStart=/usr/bin/node /opt/claude-tg-bot/bot.js
+
+Restart=always
+RestartSec=10s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-tg-bot
+
+# На маленьком сервере важно, чтобы при нехватке памяти ядро убило именно этот
+# сервис, а не соседние рабочие процессы. Потолок держим ниже общего объёма.
+OOMScoreAdjust=300
+MemoryMax=1200M
+
+# Claude Code по своей сути выполняет команды и правит файлы, поэтому жёсткая
+# песочница здесь неуместна — она сломает основную функцию.
+NoNewPrivileges=false
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target

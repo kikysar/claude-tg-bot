@@ -1,0 +1,10 @@
+[Unit]
+Description=Ночное обновление Claude Code (02:30 МСК — самое тихое время пульта)
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

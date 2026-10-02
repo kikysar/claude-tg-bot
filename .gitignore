@@ -1,0 +1,13 @@
+# секреты и локальное состояние
+.env
+*.env
+state.json
+uploads/
+probe/
+stt/
+
+# резервные копии и мусор
+*.bak
+*.bak-*
+node_modules/
+*.log

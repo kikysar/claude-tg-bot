@@ -1,0 +1,12 @@
+[Unit]
+Description=Обновление Claude Code для Telegram-пульта
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/usr/local/sbin/claude-code-update
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=15min

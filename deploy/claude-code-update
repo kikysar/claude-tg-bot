@@ -1,0 +1,29 @@
+#!/bin/bash
+# Обновляет Claude Code для Telegram-пульта (служба claude-tg-bot).
+#
+# Сам CLI под claudebot обновиться не может — глобальный npm пишет только root,
+# поэтому обновляет root по таймеру claude-code-update.timer. Новые модели
+# приходят вместе с CLI: псевдонимы opus/sonnet в нём указывают на самую новую
+# модель семейства. Бот замечает новую версию сам и пишет об этом в Telegram.
+#
+# Канал stable отстаёт от latest на неделю-две, зато без свежих поломок.
+# Если новая версия не встала — возвращаем прежнюю.
+set -uo pipefail
+PKG=@anthropic-ai/claude-code
+ver() { /usr/bin/claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
+
+cur=$(ver)
+want=$(npm view "$PKG@stable" version 2>/dev/null | tail -1)
+if [ -z "$want" ]; then echo "npm не ответил — пропускаю"; exit 0; fi
+if [ "$cur" = "$want" ]; then echo "Claude Code $cur — уже свежий"; exit 0; fi
+
+echo "Обновляю Claude Code: ${cur:-нет} → $want"
+if npm install -g --no-fund --no-audit "$PKG@$want" && [ "$(ver)" = "$want" ]; then
+  echo "Готово: $(ver)"
+  exit 0
+fi
+
+echo "Новая версия не встала — возвращаю ${cur:-нет}" >&2
+[ -n "$cur" ] && npm install -g --no-fund --no-audit "$PKG@$cur"
+echo "Сейчас: $(ver)" >&2
+exit 1
