@@ -107,6 +107,10 @@ bash models/download-ggml-model.sh base
 
 `/project` выбрать проект · `/newproject` создать · `/status` состояние · `/model` модель и режим · `/limits` остаток лимитов · `/sessions` беседы проекта · `/compact` сжать беседу · `/git` git-действия · `/new` начать заново · `/stop` остановить задачу · `/warm` прогрев кэша · `/help` помощь.
 
+## Проверка перед выкладкой
+
+`node test/harness.js` запускает бота на макетах: Telegram, Claude Code, ffmpeg и whisper подменены, время ускорено в 2000 раз, так что шесть часов прогрева проходят за секунды. Ни сети, ни расхода лимита подписки, зависимости не нужны. Прогон занимает около двух минут и заканчивается строкой «Итог: N ✓, 0 ✗». `VERBOSE=1` добавляет журнал бота, `SHOW=1` печатает экраны лимитов.
+
 ## Безопасность
 
 - В рабочем режиме Claude Code запускается с `--permission-mode bypassPermissions`: он выполняет команды и правит файлы без подтверждений, от имени `claudebot`. Не давайте этому пользователю sudo и держите в `PROJECTS_ROOT` только то, что можно ему доверить.
@@ -122,3 +126,4 @@ bash models/download-ggml-model.sh base
 | `.env.example` | шаблон настроек для `/etc/claude-tg-bot.env` |
 | `deploy/claude-tg-bot.service` | systemd-юнит бота |
 | `deploy/claude-code-update*` | ночное обновление Claude Code (необязательно) |
+| `test/harness.js`, `test/fake-claude.js` | проверка бота на макетах: поддельные Telegram и Claude Code |
