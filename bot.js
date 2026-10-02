@@ -68,11 +68,11 @@ const NO_AGENT_ENV = {
   CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS: '1',
 };
 
-const BOT_VERSION = '2026-10-02.1';
+const BOT_VERSION = '2026-10-02.2';
 const WHATS_NEW =
 `♻️ <b>Бот обновлён</b>
 
-📈 Лимиты снова на месте. Бот берёт цифры прямо из ответов Claude Code, входить на сервере для этого больше не нужно. Они обновляются с каждым ответом: если в /limits написано, что цифрам несколько часов, отправьте любое сообщение.`;
+🎙 Голосовые снова распознаются: после обновления 1 октября они падали с ошибкой про таймаут. Отправьте последнее голосовое ещё раз.`;
 
 if (!TOKEN) fatal('Не задан TELEGRAM_BOT_TOKEN');
 if (!OWNER_ID) fatal('Не задан TELEGRAM_OWNER_ID');
@@ -2144,10 +2144,10 @@ function sweepUploads() {
 
 const rm = (...files) => { for (const f of files) if (f) fs.rm(f, { force: true }, () => {}); };
 
-/** Запуск внешней программы; в ошибке — хвост её stderr. */
+/** Запуск внешней программы; в ошибке — хвост её stderr. Таймаут Node принимает только целым. */
 function run(bin, args, timeout) {
   return new Promise((resolve, reject) => {
-    execFile(bin, args, { timeout, maxBuffer: 8 << 20 }, (err, stdout, stderr) => {
+    execFile(bin, args, { timeout: Math.ceil(timeout), maxBuffer: 8 << 20 }, (err, stdout, stderr) => {
       if (!err) return resolve(String(stdout || ''));
       const tail = String(stderr || '').trim().split('\n').slice(-2).join(' ');
       reject(new Error(`${path.basename(bin)}: ${tail || err.message}`.slice(0, 300)));

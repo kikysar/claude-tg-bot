@@ -78,14 +78,24 @@ https.get = (url, opts, cb) => {
 };
 
 // ── внешние программы ──
-const runs = { ffmpeg: [], whisper: [] };
+const runs = { ffmpeg: [], whisper: [], whisperMs: [] };
 const origExecFile = cp.execFile;
+// Настоящий execFile отвергает нецелый таймаут; подмена должна быть так же строга,
+// иначе такая ошибка проходит проверку и падает только на живом голосовом.
+const strictOpts = (opts) => {
+  const t = opts && opts.timeout;
+  if (t !== undefined && !(Number.isInteger(t) && t >= 0)) {
+    throw Object.assign(new RangeError(
+      `The value of "timeout" is out of range. It must be an unsigned integer. Received ${t}`), { code: 'ERR_OUT_OF_RANGE' });
+  }
+};
 let cliVersion = '2.1.285';
 let authIn = false, limitsRuns = 0;   // есть ли сохранённый вход; сколько раз читали панель
 const PANEL = ' Current session\n  ██████████  61% used\n  Resets 7:09pm (Europe/Moscow)\n\n' +
               ' Current week (all models)\n  ████  40% used\n  Resets Oct 5, 11am (Europe/Moscow)\n';
 cp.execFile = (bin, args, opts, cb) => {
   if (typeof opts === 'function') { cb = opts; opts = {}; }
+  strictOpts(opts);
   const done = (err, so = '', se = '') => process.nextTick(() => cb && cb(err, so, se));
   if (bin === env.CLAUDE_BIN && args[0] === '--version') return done(null, `${cliVersion} (Claude Code)\n`);
   if (bin === env.CLAUDE_BIN && args[0] === 'auth') {
@@ -101,7 +111,8 @@ cp.execFile = (bin, args, opts, cb) => {
     runs.ffmpeg.push(args);
     const outp = args[args.length - 1];
     if (!args.includes('-y')) return done(new Error('exit 1'), '', '  Duration: 00:00:23.40, start: 0.000000');
-    if (outp.endsWith('.wav')) fs.writeFileSync(outp, Buffer.alloc(44 + 5 * 32000));
+    // 5,4125 с, как у настоящих записей: длительность почти никогда не бывает целой
+    if (outp.endsWith('.wav')) fs.writeFileSync(outp, Buffer.alloc(44 + 173200));
     else if (outp.includes('%02d')) {
       const n = Number(args[args.indexOf('-frames:v') + 1]);
       for (let i = 1; i <= n; i++) fs.writeFileSync(outp.replace('%02d', String(i).padStart(2, '0')), 'JPEG');
@@ -110,6 +121,7 @@ cp.execFile = (bin, args, opts, cb) => {
   }
   if (bin === WHISPER) {
     runs.whisper.push(args);
+    runs.whisperMs.push(opts.timeout);
     return done(null, ' Привет, это голосовое [музыка]. Продолжение следует...\n');
   }
   return origExecFile(bin, args, opts, cb);
@@ -214,6 +226,7 @@ require('../bot.js');
   check('расшифровка показана', texts().some((t) => t.startsWith('🎙 <i>Привет, это голосовое.')));
   const w = runs.whisper[runs.whisper.length - 1];
   check('whisper: ru, жадный поиск, окно 384', w.includes('ru') && w.includes('-bs') && w[w.indexOf('-ac') + 1] === '384', w.join(' '));
+  check('whisper: таймаут — целое число миллисекунд', runs.whisperMs.length > 0 && runs.whisperMs.every((t) => Number.isInteger(t) && t >= 120000), runs.whisperMs);
   check('исходник голосового удалён', !fs.readdirSync(path.join(tmp, 'state', 'uploads')).some((f) => /voice/.test(f)));
 
   out('5. Кружок');
