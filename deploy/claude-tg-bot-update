@@ -1,0 +1,135 @@
+#!/bin/bash
+# Автообновление бота: подтягивает новые коммиты из репозитория и перезапускает
+# службу claude-tg-bot.
+#
+# Владелец репозитория пушит правки в main, а у друзей бот должен сам оставаться
+# свежим. Запускает root-таймер claude-tg-bot-update.timer раз в 10 минут:
+#   1. сверяется с origin; нового нет — выходит;
+#   2. если бот занят (идёт задача или только что писали), откладывает до
+#      следующего раза: перезапуск оборвал бы задачу и сбросил тёплый кэш;
+#   3. подтягивает коммиты; бота перезапускает, только если изменился bot.js,
+#      правки README, тестов и limits.sh перезапуска не требуют;
+#   4. проверяет синтаксис bot.js до замены и что бот не падает после
+#      перезапуска. Иначе возвращает прежнюю версию и эту больше не пробует.
+# Об отказах пишет владельцу установки в Telegram. Об успехе бот объявит сам:
+# при запуске новой версии он присылает «Бот обновлён».
+#
+# Сам скрипт ставят копированием в /usr/local/sbin, как claude-code-update, и
+# репозиторием он не подменяется: пуш в репозиторий не должен давать запуск
+# нового кода от root. Обновляется только бот, а он работает от claudebot.
+# Если в обновлении изменились файлы в deploy/ (скрипт, юниты), скрипт пишет об
+# этом владельцу установки, и их ставят заново по README.
+#
+# Каталог должен быть клоном репозитория и принадлежать root, тогда claudebot
+# не сможет править код бота. Руками файлы в каталоге править нельзя: пока
+# они есть, обновление стоит. Свои настройки держат в /etc/claude-tg-bot.env.
+set -u
+
+REPO=${BOT_REPO:-/opt/claude-tg-bot}
+BRANCH=${BOT_BRANCH:-main}
+SERVICE=${BOT_SERVICE:-claude-tg-bot}
+STATE=${BOT_UPDATE_STATE:-/var/lib/claude-tg-bot-update}   # здесь помним коммит, который не запустился
+ENV_FILE=${BOT_ENV_FILE:-/etc/claude-tg-bot.env}
+NODE=${BOT_NODE:-node}
+QUIET=${BOT_QUIET_S:-180}     # сколько секунд после последней активности бот считается занятым
+SETTLE=${BOT_SETTLE_S:-20}    # сколько секунд бот должен простоять после перезапуска
+
+# Без вопросов про пароль, и зависший GitHub не держит нас дольше полминуты
+export GIT_TERMINAL_PROMPT=0 GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=30
+
+short() { echo "${1:0:7}"; }
+
+# Сколько раз systemd сам перезапускал службу. Обнуляет ли это число ручной restart, зависит
+# от версии systemd, поэтому судим по приросту после нашего перезапуска, а не по самому числу
+nrestarts() { local n; n=$(systemctl show -p NRestarts --value "$SERVICE" 2>/dev/null); echo "${n:-0}"; }
+
+# Значение из файла настроек, без кавычек. Весь файл не грузим: токен Claude скрипту ни к чему.
+envval() { sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | tail -1 | tr -d "\"'"; }
+
+notify() {
+  local token owner
+  token=$(envval TELEGRAM_BOT_TOKEN); owner=$(envval TELEGRAM_OWNER_ID)
+  [ -n "$token" ] && [ -n "$owner" ] || return 0
+  # адрес с токеном отдаём через stdin, чтобы он не светился в списке процессов
+  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$token" \
+    | curl -fsS -m 15 -K - --data-urlencode "chat_id=$owner" --data-urlencode "text=$1" >/dev/null 2>&1 || true
+}
+
+fail() { echo "$*" >&2; notify "⚠️ Автообновление бота: $*"; exit 1; }
+
+# Занят ли бот. Судим по его журналу: если последняя из этих строк «Запуск задачи»,
+# задача идёт; если любая другая, но свежее QUIET секунд, разговор в разгаре.
+# Строки пишет bot.js, test/updater-test.sh следит, чтобы они не разошлись.
+busy() {
+  local last ts at
+  last=$(journalctl -u "$SERVICE" -n 1000 --no-pager -o cat 2>/dev/null \
+    | grep -E 'Запуск задачи|Задача выполнена|Задача с ошибкой|Процесс Claude умер|Останавливаю процесс Claude|Процесс Claude завершился|Бот запускается|\] Сообщение|\] Вложение' \
+    | tail -1)
+  case "$last" in *'Запуск задачи'*) return 0 ;; esac
+  ts=$(printf '%s' "$last" | sed -n 's/^\[\([^]]*\)\].*/\1/p')
+  [ -n "$ts" ] || return 1
+  at=$(date -u -d "$ts" +%s 2>/dev/null) || return 1
+  [ $(( $(date +%s) - at )) -lt "$QUIET" ]
+}
+
+main() {
+  mkdir -p "$STATE"
+  exec 9>"$STATE/lock"
+  flock -n 9 || { echo "Другое обновление ещё идёт, выхожу"; return 0; }
+
+  git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 \
+    || fail "$REPO не клон репозитория или принадлежит не root: бота нужно ставить через git clone от имени root"
+  cd "$REPO" || exit 1
+  git fetch --quiet origin "$BRANCH" 2>/dev/null \
+    || { echo "GitHub не ответил, попробую в следующий раз"; return 0; }
+
+  local old new changed restart=0
+  old=$(git rev-parse HEAD)
+  new=$(git rev-parse --verify -q "origin/$BRANCH") || fail "в репозитории нет ветки $BRANCH"
+  if [ "$old" = "$new" ]; then echo "Обновлений нет: $(short "$old")"; return 0; fi
+  if [ "$new" = "$(cat "$STATE/bad" 2>/dev/null)" ]; then
+    echo "Версия $(short "$new") уже не запускалась, жду следующего коммита"; return 0
+  fi
+
+  changed=$(git diff --name-only "$old" "$new")
+  grep -qx 'bot.js' <<<"$changed" && restart=1
+  if [ "$restart" = 1 ] && busy; then
+    echo "Бот занят, обновление до $(short "$new") отложено"; return 0
+  fi
+
+  # Синтаксис проверяем до замены файла: сломанную версию на диск не кладём
+  if [ "$restart" = 1 ] && command -v "$NODE" >/dev/null 2>&1; then
+    local tmp; tmp=$(mktemp -d)
+    git show "$new:bot.js" > "$tmp/bot.js"
+    if ! "$NODE" --check "$tmp/bot.js" 2>/dev/null; then
+      rm -rf "$tmp"; echo "$new" > "$STATE/bad"
+      fail "в версии $(short "$new") ошибка в bot.js, остаюсь на $(short "$old")"
+    fi
+    rm -rf "$tmp"
+  fi
+
+  [ -z "$(git status --porcelain --untracked-files=no)" ] \
+    || fail "в $REPO есть правки, сделанные руками, поэтому обновление до $(short "$new") остановлено"
+  git reset --hard -q "$new" || fail "не удалось подтянуть $(short "$new")"
+  echo "Подтянул $(short "$old") → $(short "$new")"
+  if grep -q '^deploy/' <<<"$changed"; then
+    echo "Внимание: изменились файлы в deploy/. Скрипт обновления и юниты ставятся копированием, сам скрипт их не меняет"
+    notify "ℹ️ Автообновление бота: в репозитории изменились файлы в deploy/ (скрипт обновления или юниты systemd). Бот обновился, а их нужно поставить заново: попросите Claude сделать это по инструкции в README, шаги 5 и 6."
+  fi
+  [ "$restart" = 1 ] || { echo "bot.js не менялся, перезапуск не нужен"; return 0; }
+
+  systemctl restart "$SERVICE"
+  local before; before=$(nrestarts)
+  sleep "$SETTLE"
+  if ! systemctl is-active --quiet "$SERVICE" || [ "$(nrestarts)" != "$before" ]; then
+    git reset --hard -q "$old"
+    echo "$new" > "$STATE/bad"
+    systemctl restart "$SERVICE"
+    fail "версия $(short "$new") не запустилась, вернул $(short "$old")"
+  fi
+  echo "Бот перезапущен: $(short "$new")"
+}
+
+# Всё в функции и выход в той же строке: bash читает скрипт по ходу дела, и файл,
+# заменённый посреди запуска (повторной установкой), не должен подсунуть ему чужие команды
+main "$@"; exit $?

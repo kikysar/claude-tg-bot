@@ -1,0 +1,12 @@
+[Unit]
+Description=Автообновление Telegram-пульта из репозитория
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/usr/local/sbin/claude-tg-bot-update
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=5min

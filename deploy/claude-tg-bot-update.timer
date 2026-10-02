@@ -1,0 +1,10 @@
+[Unit]
+Description=Проверка обновлений Telegram-пульта каждые 10 минут
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
