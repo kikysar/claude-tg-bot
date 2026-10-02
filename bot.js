@@ -68,11 +68,11 @@ const NO_AGENT_ENV = {
   CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS: '1',
 };
 
-const BOT_VERSION = '2026-10-01.3';
+const BOT_VERSION = '2026-10-02.1';
 const WHATS_NEW =
 `♻️ <b>Бот обновлён</b>
 
-🗜 Когда беседа заполняется, Claude Code сам сжимает её в выжимку — так же, как в VS Code («Compacted chat · auto»). Раньше бот делал это молча, теперь пишет, сколько было и сколько осталось. В боте сжатие наступает на 200к, в VS Code — на 300к.`;
+📈 Лимиты снова на месте. Бот берёт цифры прямо из ответов Claude Code, входить на сервере для этого больше не нужно. Они обновляются с каждым ответом: если в /limits написано, что цифрам несколько часов, отправьте любое сообщение.`;
 
 if (!TOKEN) fatal('Не задан TELEGRAM_BOT_TOKEN');
 if (!OWNER_ID) fatal('Не задан TELEGRAM_OWNER_ID');
@@ -103,6 +103,7 @@ let state = {
   coolCompact: true,     // большую беседу сжимать, пока кэш не остыл, если пауза дольше окна
   announced: '',         // какую версию бота уже показали в «что нового»
   lastUsage: null,       // расход последнего ответа — по нему видно объём контекста
+  rate: null,            // цифры лимитов подписки из потока Claude Code, см. noteRateLimit
   usage: { total: { cost: 0, tasks: 0, inTok: 0, outTok: 0 }, byDay: {}, byProject: {},
            warm: { pings: 0, base: 0, compacts: 0 } },
   lastAnswer: '',        // для кнопки «показать полностью»
@@ -811,10 +812,13 @@ function startEngine() {
         noteModel(e, ev.message.model);
         if (ev.message.usage) e.lastCall = ev.message.usage;
       }
+      if (ev.type === 'rate_limit_event') { try { noteRateLimit(ev.rate_limit_info); } catch {} }
       if (e.onEvent) { try { e.onEvent(ev); } catch {} }
 
       if (ev.type === 'result') {
         e.lastTurnAt = Date.now();
+        // Событие о лимитах идёт только при смене процента: тихий ответ значит «без перемен»
+        if (state.rate) state.rate.seenAt = e.lastTurnAt;
         if (!e.turnIsPing) { e.lastUserAt = e.lastTurnAt; e.coolDone = false; }
         state.lastCtx = ctxOf(e.lastCall); saveState();
         if (e.waiter) { const w = e.waiter; e.waiter = null; e.onEvent = null; w.resolve(ev); }
@@ -1191,6 +1195,80 @@ function tasksSummary() {
   return L.join('\n');
 }
 
+// ── Лимиты из потока Claude Code ──
+// С каждым ответом Claude Code присылает rate_limit_event: долю израсходованного
+// пятичасового и недельного лимита (0…1) и время сброса. Это те же цифры, что в
+// панели /usage, но без входа в интерактивном режиме и без второго процесса.
+// Токен бота их не закрывает, в отличие от /api/oauth/usage, где нужно право
+// user:profile. Событие приходит при каждой смене целого процента или времени
+// сброса, поэтому цифры свежи настолько, насколько свежа последняя работа Claude.
+const RATE_WINDOWS = [
+  { key: 'five_hour',        name: 'Сессия', period: '5 часов' },
+  { key: 'seven_day',        name: 'Неделя', period: 'все модели' },
+  { key: 'seven_day_opus',   name: 'Неделя', period: 'Opus' },
+  { key: 'seven_day_sonnet', name: 'Неделя', period: 'Sonnet' },
+];
+
+function noteRateLimit(info) {
+  if (!info || typeof info !== 'object') return;
+  const R = state.rate || (state.rate = { windows: {}, at: 0, seenAt: 0, blocked: null });
+  const take = (key, w) => {
+    const u = Number(w && w.utilization), reset = Number(w && w.resetsAt);
+    if (Number.isFinite(u) && u >= 0 && Number.isFinite(reset) && reset > 0) R.windows[key] = { u, reset };
+  };
+  for (const [key, w] of Object.entries(info.unifiedWindows || {})) take(key, w);
+  // Окно, из-за которого пришло событие: так видны Opus и Sonnet, у которых своих полей нет
+  if (info.rateLimitType && !(info.unifiedWindows && info.unifiedWindows[info.rateLimitType])) {
+    take(info.rateLimitType, { utilization: info.utilization, resetsAt: info.resetsAt });
+  }
+  R.blocked = info.status === 'rejected' && Number(info.resetsAt) > 0
+    ? { type: info.rateLimitType || '', reset: Number(info.resetsAt) } : null;
+  R.at = R.seenAt = Date.now();
+  const pct = (k) => (R.windows[k] ? Math.round(R.windows[k].u * 100) : null);
+  log('INFO', 'Лимиты из потока', { сессия: pct('five_hour'), неделя: pct('seven_day'), статус: info.status });
+  saveState();
+}
+
+const MSK_MONTHS = ['янв', 'фев', 'мар', 'апр', 'мая', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
+
+/** Секунды Unix → «в 16:30 МСК» или «5 окт в 11:00 МСК». Москва без перехода на летнее время, UTC+3. */
+function fmtResetAt(sec) {
+  const m = new Date((sec + 3 * 3600) * 1000), now = new Date(Date.now() + 3 * 3600e3);
+  const hm = `${String(m.getUTCHours()).padStart(2, '0')}:${String(m.getUTCMinutes()).padStart(2, '0')}`;
+  const sameDay = m.getUTCFullYear() === now.getUTCFullYear() && m.getUTCMonth() === now.getUTCMonth()
+    && m.getUTCDate() === now.getUTCDate();
+  return `${sameDay ? '' : `${m.getUTCDate()} ${MSK_MONTHS[m.getUTCMonth()]} `}в ${hm} МСК`;
+}
+
+/** «через 2 д 21 ч», «через 1 ч 17 мин», «через 12 мин». */
+function fmtIn(sec) {
+  const min = Math.max(1, Math.round(sec / 60));
+  const d = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60), mm = min % 60;
+  if (d) return `через ${d} д${h ? ` ${h} ч` : ''}`;
+  if (h) return `через ${h} ч${mm ? ` ${mm} мин` : ''}`;
+  return `через ${mm} мин`;
+}
+
+/** Блоки для экрана лимитов из последних событий потока. */
+function rateBlocks() {
+  const R = state.rate;
+  if (!R || !R.windows) return null;
+  const nowSec = Date.now() / 1000;
+  const blocks = [];
+  for (const w of RATE_WINDOWS) {
+    const v = R.windows[w.key];
+    if (!v) continue;
+    if (v.reset <= nowSec) {
+      // окно сменилось, а новых цифр ещё не было — выдумывать ноль нельзя
+      if (w.key === 'five_hour' || w.key === 'seven_day') blocks.push({ ...w, pct: null, reset: '' });
+      continue;
+    }
+    blocks.push({ ...w, pct: Math.min(100, Math.round(v.u * 100)),
+                  reset: `${fmtResetAt(v.reset)}, ${fmtIn(v.reset - nowSec)}` });
+  }
+  return { blocks, seenAt: R.seenAt || R.at, blocked: R.blocked };
+}
+
 // Чтение панели занимает около трёх секунд и поднимает отдельный процесс,
 // поэтому держим свежий результат под рукой: повторный запрос отвечает мгновенно.
 const LIMITS_TTL = 90 * 1000;
@@ -1211,13 +1289,18 @@ function readLimits() {
  */
 function getLimits(force = false) {
   const fresh = Date.now() - limitsCache.at < LIMITS_TTL;
-  if (!force && fresh && limitsCache.raw) {
+  if (!force && fresh && limitsCache.at) {
     return Promise.resolve({ ...limitsCache, cached: true });
   }
   if (limitsCache.inFlight) return limitsCache.inFlight;
 
-  limitsCache.inFlight = Promise.all([readAuth(), readLimits()])
-    .then(([auth, raw]) => {
+  // Сначала вход, потом панель, не вместе. Оба процесса продлевают сохранённый
+  // вход одним ключом обновления, и при гонке сервер отказывает второму —
+  // 01.10.2026 так стёрся вход. Без входа панель пуста, второй процесс не нужен:
+  // цифры берём из потока Claude Code.
+  limitsCache.inFlight = readAuth()
+    .then(async (auth) => {
+      const raw = auth && auth.loggedIn === false ? '' : await readLimits();
       limitsCache = { raw, auth, at: Date.now(), inFlight: null };
       return { ...limitsCache, cached: false };
     })
@@ -1310,11 +1393,13 @@ const PLANS = { pro: 'Claude Pro', max: 'Claude Max', team: 'Claude Team',
 /** Единый экран: аккаунт, остаток лимитов подписки, собственный учёт бота. */
 async function screenUsage(force = false) {
   // свежий кэш — отвечаем сразу, без сообщения-заглушки
-  const ready = !force && Date.now() - limitsCache.at < LIMITS_TTL && limitsCache.raw;
+  const ready = !force && limitsCache.at && Date.now() - limitsCache.at < LIMITS_TTL;
   const wait = ready ? null : await send('🔄 Считываю лимиты…');
 
   const { auth, raw, at, cached } = await getLimits(force);
-  const { blocks } = parseUsagePanel(raw);
+  const panel = parseUsagePanel(raw).blocks;        // точная панель — если на сервере есть вход
+  const live = panel.length ? null : rateBlocks();  // иначе цифры из последних ответов Claude
+  const blocks = panel.length ? panel : (live ? live.blocks : []);
 
   const L = ['📊 <b>Использование</b>', ''];
 
@@ -1327,25 +1412,36 @@ async function screenUsage(force = false) {
 
   if (blocks.length) {
     L.push('<b>Лимиты подписки</b>');
+    const blocked = live && live.blocked && live.blocked.reset > Date.now() / 1000 ? live.blocked : null;
+    if (blocked) {
+      const w = RATE_WINDOWS.find((x) => x.key === blocked.type);
+      L.push(`⛔ <b>Лимит исчерпан</b>${w ? ` — ${esc(w.name.toLowerCase())} (${esc(w.period)})` : ''}, ` +
+             `сброс ${esc(fmtResetAt(blocked.reset))}`);
+    }
     for (const b of blocks) {
       const warn = b.pct >= 90 ? ' 🔴' : b.pct >= 70 ? ' 🟡' : '';
       L.push('', `${esc(b.name)} <i>(${esc(b.period)})</i>${warn}`);
+      if (b.pct === null) { L.push('<i>окно сменилось — новые цифры придут с ближайшим ответом Claude</i>'); continue; }
       L.push(`<code>${bar(b.pct)}</code> <b>${b.pct}%</b>`);
       if (b.reset) L.push(`<i>сброс ${esc(b.reset)}</i>`);
     }
     L.push('');
-  } else if (/Select login method/i.test(raw)) {
-    L.push('⚠️ <b>Лимиты недоступны</b>', 'Нужен вход в интерактивном режиме:',
-           '<code>sudo -iu claudebot claude auth login</code>', '');
   } else {
-    L.push('⚠️ Панель лимитов не прочиталась — возможно, Claude Code обновился.', '');
+    L.push('📭 <b>Цифр лимитов пока нет</b>',
+           'Claude Code присылает их вместе с каждым ответом. Отправьте любое сообщение, ' +
+           'а когда он ответит, нажмите «Обновить».', '');
   }
 
   L.push('📋 <b>Задач через бота</b>', tasksSummary());
 
-  if (cached || Date.now() - at > 5000) {
-    const age = Math.round((Date.now() - at) / 1000);
-    L.push('', `<i>данные ${age < 60 ? `${age} с` : `${Math.round(age / 60)} мин`} назад</i>`);
+  const ago = (sec) => (sec < 60 ? `${sec} с` : sec < 3600 ? `${Math.round(sec / 60)} мин`
+    : `${Math.floor(sec / 3600)} ч ${Math.round((sec % 3600) / 60)} мин`);
+  if (live) {
+    const age = Math.max(0, Math.round((Date.now() - live.seenAt) / 1000));
+    L.push('', `<i>цифры из последнего ответа Claude, ${ago(age)} назад` +
+               `${age > 3 * 3600 ? ' — обновятся со следующим ответом' : ''}</i>`);
+  } else if (cached || Date.now() - at > 5000) {
+    L.push('', `<i>данные ${ago(Math.round((Date.now() - at) / 1000))} назад</i>`);
   }
 
   const text = L.join('\n');

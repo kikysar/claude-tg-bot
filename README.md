@@ -10,7 +10,7 @@
 - Node.js 20+
 - свой аккаунт Claude (Pro или Max)
 - бот от [@BotFather](https://t.me/BotFather) и ваш числовой Telegram ID ([@userinfobot](https://t.me/userinfobot))
-- `tmux` — только для команды `/limits`
+- `tmux` — только для необязательной точной панели `/limits` (шаг 3)
 
 Имя пользователя `claudebot` и путь `/opt/claude-tg-bot` зашиты в юнит и в подсказки бота, поэтому оставьте их как в инструкции.
 
@@ -43,7 +43,7 @@ sudo -iu claudebot claude setup-token
 
 Команда выведет ссылку для входа и в конце токен. Это значение `CLAUDE_CODE_OAUTH_TOKEN`.
 
-Чтобы `/limits` показывал аккаунт и остаток лимитов, войдите ещё и обычным способом (без этого остальное работает):
+`/limits` работает и так: пятичасовой и недельный лимиты бот берёт из ответов Claude Code, цифры появляются после первого же ответа и обновляются с каждым следующим. Чтобы видеть ещё и аккаунт и читать точную панель `/usage`, войдите вторым способом, обычным (необязательно):
 
 ```bash
 sudo -iu claudebot claude auth login
@@ -118,7 +118,7 @@ bash models/download-ggml-model.sh base
 | Файл | Назначение |
 |---|---|
 | `bot.js` | сам бот, одним файлом, без зависимостей |
-| `limits.sh` | читает панель `/usage` из интерактивного Claude Code (нужен `tmux`) |
+| `limits.sh` | читает точную панель `/usage`, если на сервере выполнен обычный вход (нужен `tmux`, необязательно) |
 | `.env.example` | шаблон настроек для `/etc/claude-tg-bot.env` |
 | `deploy/claude-tg-bot.service` | systemd-юнит бота |
 | `deploy/claude-code-update*` | ночное обновление Claude Code (необязательно) |
