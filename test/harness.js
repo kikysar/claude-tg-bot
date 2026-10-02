@@ -63,7 +63,7 @@ https.request = (opts, cb) => {
       return;
     }
     if (method !== 'sendChatAction') calls.push({ method, payload, h: hours() });
-    if (method === 'sendMessage') return respond({ message_id: ++msgId });
+    if (method === 'sendMessage') { const id = ++msgId; calls[calls.length - 1].id = id; return respond({ message_id: id }); }
     if (method === 'getMe') return respond({ username: 'testbot' });
     if (method === 'getFile') return respond({ file_path: `files/${payload.file_id}` });
     respond(true);
@@ -89,6 +89,8 @@ const strictOpts = (opts) => {
       `The value of "timeout" is out of range. It must be an unsigned integer. Received ${t}`), { code: 'ERR_OUT_OF_RANGE' });
   }
 };
+const WHISPER_SAYS = ' Привет, это голосовое [музыка]. Продолжение следует...\n';
+let whisperOut = WHISPER_SAYS, whisperFail = false;   // что «слышит» whisper и не упал ли он
 let cliVersion = '2.1.285';
 let authIn = false, limitsRuns = 0;   // есть ли сохранённый вход; сколько раз читали панель
 const PANEL = ' Current session\n  ██████████  61% used\n  Resets 7:09pm (Europe/Moscow)\n\n' +
@@ -122,7 +124,8 @@ cp.execFile = (bin, args, opts, cb) => {
   if (bin === WHISPER) {
     runs.whisper.push(args);
     runs.whisperMs.push(opts.timeout);
-    return done(null, ' Привет, это голосовое [музыка]. Продолжение следует...\n');
+    if (whisperFail) return done(new Error('exit 1'), '', 'whisper: модель не загрузилась');
+    return done(null, whisperOut);
   }
   return origExecFile(bin, args, opts, cb);
 };
@@ -218,16 +221,46 @@ require('../bot.js');
 
   out('4. Голосовое');
   b = fakeLog().length;
+  const c0 = calls.length;
   msg({ voice: { file_id: 'v1', duration: 5, file_size: 5000 } });
   await waitFor('голосовое ушло', () => userAsks(b).length >= 1);
   u = userAsks(b);
   check('мусор whisper вычищен', !u[0].msg.includes('Продолжение следует') && !u[0].msg.includes('[музыка]'), u[0].msg);
   check('пометка про голосовое', u[0].msg.includes('🎙 Голосовое 0:05'), u[0].msg);
   check('расшифровка показана', texts().some((t) => t.startsWith('🎙 <i>Привет, это голосовое.')));
+  const sent4 = calls.slice(c0).filter((c) => c.method === 'sendMessage');
+  const status4 = sent4.find((c) => c.payload.text === '🎙 Распознаю…');
+  const heard4 = sent4.find((c) => c.payload.text.startsWith('🎙 <i>Привет, это голосовое.'));
+  check('расшифровка — отдельным сообщением со звуком', heard4 && !heard4.payload.disable_notification, heard4 && heard4.payload);
+  check('статус «Распознаю…» без звука', status4 && status4.payload.disable_notification === true, status4 && status4.payload);
+  check('статус убран после расшифровки', status4 && calls.slice(c0).some((c) => c.method === 'deleteMessage' && c.payload.message_id === status4.id), status4);
+  check('расшифровка не правкой статуса', !calls.slice(c0).some((c) => c.method === 'editMessageText' && c.payload.text.startsWith('🎙')));
   const w = runs.whisper[runs.whisper.length - 1];
   check('whisper: ru, жадный поиск, окно 384', w.includes('ru') && w.includes('-bs') && w[w.indexOf('-ac') + 1] === '384', w.join(' '));
   check('whisper: таймаут — целое число миллисекунд', runs.whisperMs.length > 0 && runs.whisperMs.every((t) => Number.isInteger(t) && t >= 120000), runs.whisperMs);
   check('исходник голосового удалён', !fs.readdirSync(path.join(tmp, 'state', 'uploads')).some((f) => /voice/.test(f)));
+
+  // сбой распознавания и «слов не разобрано» тоже приходят новым сообщением, а задача не уходит
+  const shown = (from, start) => calls.slice(from).find((c) => c.method === 'sendMessage' && c.payload.text.startsWith(start));
+  const statusGone = (from, statusText) => {
+    const s = calls.slice(from).find((c) => c.method === 'sendMessage' && c.payload.text === statusText);
+    return !!s && calls.slice(from).some((c) => c.method === 'deleteMessage' && c.payload.message_id === s.id);
+  };
+  b = fakeLog().length;
+  const c1 = calls.length;
+  whisperFail = true;
+  msg({ voice: { file_id: 'v2', duration: 4, file_size: 4000 } });
+  await waitFor('сбой показан', () => shown(c1, '❌ Не удалось разобрать'));
+  whisperFail = false;
+  check('сбой распознавания — новым сообщением, статус убран', statusGone(c1, '🎙 Распознаю…'), calls.slice(c1).map((c) => c.method));
+  const c2 = calls.length;
+  whisperOut = ' [музыка]\n';
+  msg({ voice: { file_id: 'v3', duration: 3, file_size: 3000 } });
+  await waitFor('«слов нет» показано', () => shown(c2, '🤔'));
+  whisperOut = WHISPER_SAYS;
+  check('«слов не разобрал» — новым сообщением, статус убран', statusGone(c2, '🎙 Распознаю…'), calls.slice(c2).map((c) => c.method));
+  await sleepReal(60);
+  check('после сбоев задача Claude не уходила', userAsks(b).length === 0, userAsks(b));
 
   out('5. Кружок');
   b = fakeLog().length;
@@ -241,6 +274,10 @@ require('../bot.js');
   check('кадры: длительность из файла, шаг с запасом', fr && fr[fr.indexOf('-ss') + 1] === '1.95',
         runs.ffmpeg.map((r) => r.join(' ')).filter((r) => r.includes('fps=')));
   check('статус кружка', texts().some((t) => t.startsWith('🎥 Кружок 0:23 · 6 кадров\n🎙')));
+  check('кружок: итог новым сообщением, статус тихий и убран', (() => {
+    const s = calls.find((c) => c.method === 'sendMessage' && c.payload.text === '🎥 Смотрю кружок…');
+    return !!s && s.payload.disable_notification === true && calls.some((c) => c.method === 'deleteMessage' && c.payload.message_id === s.id);
+  })());
 
   out('6. Фото и текст следом');
   b = fakeLog().length;

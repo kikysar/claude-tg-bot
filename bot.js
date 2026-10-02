@@ -68,11 +68,11 @@ const NO_AGENT_ENV = {
   CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS: '1',
 };
 
-const BOT_VERSION = '2026-10-02.2';
+const BOT_VERSION = '2026-10-02.3';
 const WHATS_NEW =
 `♻️ <b>Бот обновлён</b>
 
-🎙 Голосовые снова распознаются: после обновления 1 октября они падали с ошибкой про таймаут. Отправьте последнее голосовое ещё раз.`;
+🎙 Расшифровка голосовых, аудио, кружков и видео теперь приходит отдельным сообщением сразу после распознавания, со звуком. Раньше правилась строка «Распознаю…»: тихо, и это легко было не заметить.`;
 
 if (!TOKEN) fatal('Не задан TELEGRAM_BOT_TOKEN');
 if (!OWNER_ID) fatal('Не задан TELEGRAM_OWNER_ID');
@@ -2253,8 +2253,15 @@ const TITLE = { voice: '🎙 Голосовое', audio: '🎧 Аудио', note
  * слова (подпись, расшифровка), картинки для модели, пометку для Claude.
  */
 async function preparePart(msg, m) {
-  const status = STATUS[m.kind] ? await send(STATUS[m.kind]) : null;
-  const say = (html) => (status ? edit(status.message_id, html) : send(html));
+  // Статус временный и без звука: итог придёт отдельным сообщением и зазвенит один раз
+  const status = STATUS[m.kind] ? await send(STATUS[m.kind], { disable_notification: true }) : null;
+  // Итог — новым сообщением, а не правкой статуса: правка не звонит и в чате легко теряется
+  const say = async (html) => {
+    const sent = await send(html);
+    if (!sent) return status ? edit(status.message_id, html) : null;   // не дошло — хотя бы правкой
+    if (status) tg('deleteMessage', { chat_id: OWNER_ID, message_id: status.message_id }).catch(() => {});
+    return sent;
+  };
   try {
     return await buildPart(msg, m, say);
   } catch (e) {
