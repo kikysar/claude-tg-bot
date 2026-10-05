@@ -489,6 +489,19 @@ require('../bot.js');
   await waitFor('статус', () => texts().filter((t) => t.includes('Состояние')).length >= 2);
   check('старый процесс ждёт паузы', lastWith('Состояние').payload.text.includes('ждёт паузы'), lastWith('Состояние').payload.text);
 
+  out('13. Долгая задача не обрывается');
+  b = fakeLog().length;
+  const c13 = calls.length, t13 = hours();
+  const since13 = () => calls.slice(c13).map((c) => c.payload.text || '');
+  text('очень долго: задача 16');
+  await waitFor('итог долгой задачи', () => since13().some((t) => t.includes('Ответ на: очень долго') || t.includes('Остановлено')), 60000);
+  const took13 = hours() - t13;
+  const after13 = since13();
+  check('задача шла дольше получаса', took13 > 1.0, took13.toFixed(2));
+  check('таймаут не сработал', count('Превышен таймаут') === 0 && !after13.some((t) => t.includes('Остановлено')), after13);
+  check('ответ пришёл', after13.some((t) => t.includes('Ответ на: очень долго: задача 16')), after13);
+  check('в итоге указано время больше часа', after13.some((t) => /✅ 1 ч \d+ мин/.test(t)), after13);
+
   out(`\nИтог: ${ok} ✓, ${bad} ✗`);
   process.exit(bad ? 1 : 0);
 })().catch((e) => {

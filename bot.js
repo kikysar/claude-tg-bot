@@ -21,7 +21,6 @@ const OWNER_ID = String(process.env.TELEGRAM_OWNER_ID || '').trim();
 const PROJECTS_ROOT = process.env.PROJECTS_ROOT || '/opt/projects';
 const STATE_FILE = process.env.STATE_FILE || '/var/lib/claude-tg-bot/state.json';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || '/usr/bin/claude';
-const TASK_TIMEOUT_MS = Number(process.env.TASK_TIMEOUT_MIN || 30) * 60 * 1000;
 
 // Голосовой ввод: локальный whisper.cpp + статический ffmpeg (без root и без
 // API-ключа). Всё лежит в каталоге состояния, права claudebot.
@@ -68,11 +67,11 @@ const NO_AGENT_ENV = {
   CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS: '1',
 };
 
-const BOT_VERSION = '2026-10-02.3';
+const BOT_VERSION = '2026-10-05.1';
 const WHATS_NEW =
 `♻️ <b>Бот обновлён</b>
 
-🎙 Расшифровка голосовых, аудио, кружков и видео теперь приходит отдельным сообщением сразу после распознавания, со звуком. Раньше правилась строка «Распознаю…»: тихо, и это легко было не заметить.`;
+⏱ Убрал лимит в 30 минут на задачу: теперь она идёт, пока Claude не закончит, хоть час, хоть больше. Прервать можно командой /stop.`;
 
 if (!TOKEN) fatal('Не задан TELEGRAM_BOT_TOKEN');
 if (!OWNER_ID) fatal('Не задан TELEGRAM_OWNER_ID');
@@ -930,11 +929,7 @@ async function runClaude(task) {
     );
   };
 
-  const timer = setTimeout(() => {
-    log('WARN', 'Превышен таймаут задачи');
-    stopChild('таймаут');
-  }, TASK_TIMEOUT_MS);
-
+  // Длительность задачи не ограничена: бывают и часовые. Оборвать можно только по /stop.
   const typing = setInterval(() => {
     tg('sendChatAction', { chat_id: OWNER_ID, action: 'typing' }).catch(() => {});
   }, 6000);
@@ -952,7 +947,6 @@ async function runClaude(task) {
     }
   }, { skip: () => Boolean(me?.cancelled) });
 
-  clearTimeout(timer);
   clearInterval(typing);
   const cancelled = me?.cancelled;
   const reason = me?.cancelReason;

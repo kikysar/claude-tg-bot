@@ -53,7 +53,8 @@ async function handle(msg) {
   if (!ping) {
     out({ type: 'assistant', session_id: sid, message: { model: 'claude-opus-5-5', usage: usage(),
       content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls -la' } }] } });
-    await sleep(text.includes('долго') ? 400 : 15);
+    // «очень долго» — больше полутора часов по ускоренным часам бота (2,6 с × 2000)
+    await sleep(text.includes('очень долго') ? 2600 : text.includes('долго') ? 400 : 15);
   }
   const u = usage();
   out({ type: 'assistant', session_id: sid, message: { model: 'claude-opus-5-5', usage: u,
