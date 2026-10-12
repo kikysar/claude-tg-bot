@@ -26,6 +26,8 @@ env.FAKE_LOG = path.join(tmp, 'fake.log');
 env.FAKE_COLD = path.join(tmp, 'cold.flag');
 env.FAKE_SLOW = path.join(tmp, 'slow.flag');
 env.FAKE_RATE = path.join(tmp, 'rate.json');
+env.FAKE_GONE = path.join(tmp, 'gone.txt');            // номера бесед, файлов которых «на сервере уже нет»
+env.FAKE_GONE_SILENT = path.join(tmp, 'gone-silent.flag');   // при пропавшей беседе Claude Code не присылает итог, а выходит с ошибкой в stderr
 env.MEMINFO_FILE = path.join(tmp, 'meminfo');      // сколько памяти «свободно» для переводчика через Claude Code
 const memInfo = (mb) => fs.writeFileSync(env.MEMINFO_FILE, `MemTotal:  980000 kB\nMemFree:  60000 kB\nMemAvailable:  ${Math.round(mb * 1024)} kB\n`);
 memInfo(500);
@@ -1558,6 +1560,57 @@ let c14r = 0;
     [OAUTH, 'sk-ant-api03-test-api-key', 'test-auth-token-must-not-reach', DS_KEY, OLD_KEY].every((k) => !everything.includes(k)));
   check('и ни в аргументы, ни в stdin переводчика', trRuns.every((r) => ![OAUTH, 'sk-ant-api03', DS_KEY, OLD_KEY].some((k) => JSON.stringify(r.args).includes(k) || r.input.includes(k))));
   check('DeepSeek за весь раздел не тронут', ds.length === d15, ds.length - d15);
+
+  // ── беседы проекта на сервере больше нет (файл удалили или перенесли): бот начинает новую сам, а задача не теряется ──
+  // Так выглядело первое сообщение после обновления: процесс поднялся с --resume и номером беседы, которую уже убрали
+  out('16. Беседа пропала с сервера');
+  const cwdG = st().activeProject, gone1 = st().sessions[cwdG];
+  const startArg = (s, f) => s[s.indexOf(f) + 1];
+  check('у проекта есть беседа, которую можно «потерять»', Boolean(cwdG && gone1), st().sessions);
+  // Процесс отвечает и выходит (как выгруженный): следующее сообщение поднимет новый, с --resume
+  const exitsG = count('Процесс Claude завершился, код 0');
+  await task15(`ответь и выйди EXITAFTER ${MIX}`);
+  await waitFor('процесс Claude вышел', () => count('Процесс Claude завершился, код 0') > exitsG, 5000);
+  fs.writeFileSync(env.FAKE_GONE, `${gone1}\n`);
+  let bG = fakeLog().length, lG = logs.length;
+  T = await task15(`после переноса ${MIX}`);
+  let starts = fakeLog().slice(bG).filter((x) => x.start).map((x) => x.start);
+  const notice = (from) => textsFrom(from).filter((t) => t.includes('Прежней беседы проекта') && t.includes('demo') && t.includes('начинаю новую')).length;
+  check('первый запуск шёл по старому номеру (--resume), второй — с новой беседой (--session-id): два запуска',
+    starts.length === 2 && startArg(starts[0], '--resume') === gone1 && !starts[1].includes('--resume') && starts[1].includes('--session-id'), starts);
+  check('Claude получил запрос один раз', T.got.length === 1 && T.got[0] === EN(`после переноса ${MIX}`), T.got);
+  check('перевод запроса не повторялся: два вызова, туда и обратно', T.runs.length === 2 && T.runs[0].dir === 'in' && T.runs[1].dir === 'out', T.runs.map((r) => r.dir));
+  check('владелец видит ответ, а не ошибку', T.shown.startsWith('✅') && T.shown.includes(RUC(ANS(EN(`после переноса ${MIX}`)))), T.shown);
+  check('владельцу сказано один раз, что беседа начата заново', notice(T.c) === 1 && !textsFrom(T.c).some((t) => t.includes('Ошибка')), textsFrom(T.c));
+  check('номер беседы в состоянии заменён новым', st().sessions[cwdG] !== gone1 && st().sessions[cwdG] === startArg(starts[1], '--session-id'), st().sessions);
+  check('в журнале предупреждение, а не ошибка задачи', logs.slice(lG).some((l) => l.includes('[WARN] Беседа проекта не найдена')) && !logs.slice(lG).some((l) => l.includes('Задача с ошибкой')), logs.slice(lG));
+  const sid2 = st().sessions[cwdG];
+  bG = fakeLog().length;
+  T = await task15(`следующее сообщение ${MIX}`);
+  check('дальше всё как обычно: тот же процесс, та же новая беседа, повторных объяснений нет',
+    fakeLog().slice(bG).filter((x) => x.start).length === 0 && st().sessions[cwdG] === sid2 && notice(T.c) === 0 && T.shown.startsWith('✅'), T.shown);
+
+  // Другая версия Claude Code могла бы не присылать итог хода, а просто выйти: тогда причина только в stderr
+  fs.writeFileSync(env.FAKE_GONE_SILENT, '1');
+  await task15(`снова выйди EXITAFTER ${MIX}`);
+  await waitFor('процесс Claude вышел снова', () => count('Процесс Claude завершился, код 0') > exitsG + 1, 5000);
+  fs.writeFileSync(env.FAKE_GONE, `${gone1}\n${sid2}\n`);
+  bG = fakeLog().length;
+  T = await task15(`ещё раз после переноса ${MIX}`);
+  starts = fakeLog().slice(bG).filter((x) => x.start).map((x) => x.start);
+  check('без итога хода (только stderr): тоже начинает новую беседу и отвечает',
+    starts.length === 2 && startArg(starts[0], '--resume') === sid2 && starts[1].includes('--session-id') && T.shown.startsWith('✅') &&
+    T.got.length === 1 && T.got[0] === EN(`ещё раз после переноса ${MIX}`) && notice(T.c) === 1 && st().sessions[cwdG] !== sid2, { starts, shown: T.shown });
+  fs.unlinkSync(env.FAKE_GONE); fs.unlinkSync(env.FAKE_GONE_SILENT);
+
+  // Беседу сбрасываем только по прямому ответу «не найдена»: другая ошибка или такие слова в обычном ответе её не трогают
+  const sid3 = st().sessions[cwdG];
+  T = await task15(`сбой FAILRUN ${MIX}`);
+  check('другая ошибка: владелец видит причину, беседа цела, о новой беседе ни слова',
+    T.shown.startsWith('❌') && T.shown.includes('boom: some other failure') && st().sessions[cwdG] === sid3 && notice(T.c) === 0, T.shown);
+  T = await task15('No conversation found with session ID: abc');
+  check('те же слова в обычном ответе беседу не сбрасывают: тот же номер, один запрос, без объяснений',
+    T.shown.startsWith('✅') && T.got.length === 1 && st().sessions[cwdG] === sid3 && notice(T.c) === 0, { shown: T.shown, got: T.got });
 
   // ── остановка бота (systemctl restart): висящий переводчик не должен осиротеть ──
   timerSpeed = 1;             // таймауты настоящие: иначе зависший переводчик погиб бы сам раньше, чем бот получит сигнал

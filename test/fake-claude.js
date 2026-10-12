@@ -49,10 +49,34 @@ process.stdin.on('data', (c) => {
 });
 process.stdin.on('end', () => chain.then(() => process.exit(0)));
 
+// Беседа, файла которой на сервере нет (удалили или перенесли): настоящий Claude Code на --resume ничего не делает, присылает
+// result с ошибкой и текстом в errors, пишет то же в stderr и выходит с кодом 1. Какие беседы «пропали», говорит файл FAKE_GONE.
+const gone = args.includes('--resume') && process.env.FAKE_GONE && fs.existsSync(process.env.FAKE_GONE) &&
+  fs.readFileSync(process.env.FAKE_GONE, 'utf8').split('\n').includes(at('--resume'));
+
 async function handle(msg) {
+  if (gone) {
+    log({ gone: sid });
+    // FAKE_GONE_SILENT — вариант без итога хода: процесс просто выходит, а причина только в stderr
+    if (!(process.env.FAKE_GONE_SILENT && fs.existsSync(process.env.FAKE_GONE_SILENT))) {
+      out({ type: 'result', subtype: 'error_during_execution', duration_ms: 0, is_error: true, num_turns: 0, session_id: sid,
+            total_cost_usd: 0, usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+            errors: [`No conversation found with session ID: ${sid}`] });
+    }
+    process.stderr.write(`No conversation found with session ID: ${sid}\n`);
+    setTimeout(() => process.exit(1), 20);
+    return;
+  }
   const content = msg.message.content;
   const text = content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
   log({ msg: text, kinds: content.map((b) => b.type), images: content.filter((b) => b.type === 'image').length });
+  // FAILRUN — ход закончился другой ошибкой (не про пропавшую беседу): процесс жив, беседа цела
+  if (text.includes('FAILRUN')) {
+    out({ type: 'result', subtype: 'error_during_execution', duration_ms: 0, is_error: true, num_turns: 0, session_id: sid,
+          total_cost_usd: 0, usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+          errors: ['boom: some other failure'] });
+    return;
+  }
   out({ type: 'system', subtype: 'init', session_id: sid, model: 'claude-opus-5-5' });
   const ping = text.includes('служебный пинг');
   const cold = ping && process.env.FAKE_COLD && fs.existsSync(process.env.FAKE_COLD);
@@ -95,4 +119,6 @@ async function handle(msg) {
   out({ type: 'result', subtype: 'success', is_error: false, session_id: sid, total_cost_usd: 0.01,
     result: ping ? '.' : answerFor(text),
     usage: { ...u, cache_read_input_tokens: u.cache_read_input_tokens * (ping ? 1 : 2) } });
+  // EXITAFTER — ответил и завершился (как процесс, который выгрузили): следующее сообщение поднимет новый, с --resume
+  if (text.includes('EXITAFTER')) setTimeout(() => process.exit(0), 30);
 }

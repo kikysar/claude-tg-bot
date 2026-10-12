@@ -1538,7 +1538,7 @@ function startEngine() {
   const die = (why) => {
     if (engine === e) engine = null;
     clearTimeout(e.idleTimer);
-    if (e.waiter) { const w = e.waiter; e.waiter = null; w.resolve({ __dead: true, why }); }
+    if (e.waiter) { const w = e.waiter; e.waiter = null; w.resolve({ __dead: true, why, stderr: e.stderr }); }
   };
   child.on('close', (code) => { log('INFO', `Процесс Claude завершился, код ${code}`); die(`код ${code}`); });
   child.on('error', (err) => { e.stderr += `\nОшибка запуска: ${err.message}`; die(err.message); });
@@ -1589,6 +1589,16 @@ function askNow(content, onEvent, opts) {
     }
   });
 }
+
+/** Причины ошибки из итога хода: при сбое Claude Code кладёт их в errors, а result остаётся пустым. */
+const errorsOf = (res) => [].concat(res.errors || []).map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join('\n');
+
+/**
+ * Claude Code не нашёл беседу, которую бот просил продолжить: её файл удалён или перенесён с сервера.
+ * Сейчас он говорит об этом итогом хода с ошибкой, но в других версиях мог бы просто выйти — тогда текст только в stderr.
+ */
+const isSessionGone = (res) => (res.__dead || res.is_error || res.subtype !== 'success') &&
+  /No conversation found with session ID/i.test([errorsOf(res), res.result, res.stderr, engine && engine.stderr].join('\n'));
 
 async function runClaude(task) {
   const me = current;
@@ -1658,13 +1668,27 @@ async function runClaude(task) {
   // чтение файла, а каждый ход перечитывает весь контекст.
   const content = [{ type: 'text', text: promptText }, ...blocks];
 
-  const res = await ask(content, (ev) => {
+  const onEvent = (ev) => {
     if (ev.type === 'assistant' && ev.message?.content) {
       for (const b of ev.message.content) {
         if (b.type === 'tool_use') { toolCount++; lastTool = describeTool(b); progress(); }
       }
     }
-  }, { skip: () => Boolean(me?.cancelled) });
+  };
+  const skip = () => Boolean(me?.cancelled);
+  let res = await ask(content, onEvent, { skip });
+
+  // Беседы проекта на сервере больше нет (файл удалили или перенесли), а бот помнит её номер и просит продолжить: Claude Code
+  // отвечает ошибкой, не потратив ни токена. Забываем номер и начинаем новую беседу — задача не пропадает, а уходит заново.
+  if (state.sessions[cwd] && !me?.cancelled && isSessionGone(res)) {
+    log('WARN', 'Беседа проекта не найдена на сервере, начинаю новую', { cwd, беседа: state.sessions[cwd] });
+    delete state.sessions[cwd];
+    forgetContext();
+    killEngine('беседа не найдена');   // процесс уже выходит, но новый должен подняться не на нём
+    send(`🆕 Прежней беседы проекта <b>${esc(pName())}</b> на сервере не нашёл (файл удалён или перенесён), ` +
+         `поэтому начинаю новую.`).catch(() => {});
+    res = await ask(content, onEvent, { skip });
+  }
 
   // Ответ — на русский, пока на экране статус: пауза не должна выглядеть зависанием.
   // Задача считается идущей до конца перевода, новые сообщения тем временем встают в очередь.
@@ -1699,7 +1723,7 @@ async function runClaude(task) {
   if (res.__dead) {
     log('ERROR', 'Процесс Claude умер во время задачи', { why: res.why, stderr: stderrTail.slice(-400) });
     return send(`❌ <b>Процесс прервался</b> • ${fmtDur(secs)}\n\n` +
-                `<pre>${esc((stderrTail || res.why || 'без подробностей').slice(-1500))}</pre>\n\n` +
+                `<pre>${esc((stderrTail || res.stderr || res.why || 'без подробностей').slice(-1500))}</pre>\n\n` +
                 `<i>Напишите ещё раз — беседа продолжится с сохранённого места.</i>`);
   }
 
@@ -1708,7 +1732,7 @@ async function runClaude(task) {
 
   if (failedRun) {
     log('ERROR', 'Задача с ошибкой', { subtype: res.subtype });
-    const detail = (raw || stderrTail || 'нет подробностей').trim();
+    const detail = (raw || errorsOf(res) || stderrTail || 'нет подробностей').trim();
     const limitHit = /rate.?limit|usage limit|too many requests|429/i.test(detail);
     return send(
       `❌ <b>Ошибка</b> • ${fmtDur(secs)}\n\n<pre>${esc(detail.slice(0, 2500))}</pre>` +
