@@ -13,8 +13,17 @@ log({ start: args, env: {
 
 // Включён перевод — бот просит отвечать по-английски; так же отвечает и этот двойник
 const english = at('--append-system-prompt').includes('machine-translated');
+// Живой ответ для прогона с настоящим переводчиком (REALCLI): разметка, список, код в строке и блоком, путь, адрес
+const REAL_ANSWER = [
+  'The service does not start because the file `/etc/claude-tg-bot.env` has no `TELEGRAM_BOT_TOKEN` line, so the bot exits right after launch.',
+  '', '1. Add the token to the file.', '2. Restart the unit:', '', '```bash', 'sudo systemctl restart claude-tg-bot', '```', '',
+  'Then open https://example.com/logs and look for the line "Connected as @testbot" — it means the bot is up.'].join('\n');
+// На обычный вопрос про службу (первый вопрос прогона с настоящим переводчиком) отвечаем так, как ответил бы Claude, а не заглушкой
+const REAL_PLAIN = 'Check the journal first: run `journalctl -u claude-tg-bot -n 50` and look for permission errors or a missing token. If the unit fails right after a reboot, it usually starts before the network is up.';
 function answerFor(text) {
   if (!english) return `Ответ на: ${text.slice(0, 40)}`;
+  if (text.includes('REALANSWER')) return REAL_ANSWER;
+  if (/why the (?:service|bot)\b/i.test(text)) return REAL_PLAIN;
   const head = `Answer to: ${text.slice(0, 40)}`;
   if (text.includes('CODE')) {
     return `${head}\n\nRun \`ls -la /opt/app\` first.\n\n\`\`\`bash\nsudo systemctl restart claude-tg-bot\n\`\`\`\n\nThen check the log.`;
