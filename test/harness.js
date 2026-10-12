@@ -19,6 +19,12 @@ env.FAKE_LOG = path.join(tmp, 'fake.log');
 env.FAKE_COLD = path.join(tmp, 'cold.flag');
 env.FAKE_SLOW = path.join(tmp, 'slow.flag');
 env.FAKE_RATE = path.join(tmp, 'rate.json');
+// Ключ DeepSeek есть с самого начала, но перевод выключен: так до его включения всё идёт, как раньше
+const DS_KEY = 'sk-test-deepseek-0123456789abcdef', OLD_KEY = 'sk-test-old-key-must-lose-0123456789';
+env.TRANSLATE_API_KEY = DS_KEY;     // общее имя ключа главнее прежнего
+env.DEEPSEEK_API_KEY = OLD_KEY;
+fs.mkdirSync(path.dirname(env.STATE_FILE), { recursive: true });
+fs.writeFileSync(env.STATE_FILE, JSON.stringify({ translate: false }));
 fs.mkdirSync(path.join(env.PROJECTS_ROOT, 'demo'), { recursive: true });
 fs.writeFileSync(env.CLAUDE_BIN, 'bin');
 const FFMPEG = path.join(env.STT_DIR, 'bin', 'ffmpeg');
@@ -45,7 +51,45 @@ const msg = (extra) => push({ message: { message_id: ++msgId, from: { id: 1 }, c
 const text = (t) => msg({ text: t });
 const button = (data) => push({ callback_query: { id: String(++uid), from: { id: 1 }, data } });
 
+// ── DeepSeek: «перевод» оборачивает текст в EN[…] или RU[…], заглушки <x1/> возвращает на месте.
+// Русские буквы «перевод на английский» записывает латиницей, как настоящий: в английском тексте
+// кириллицы не остаётся, а бот по доле кириллицы решает, переводить ли ответ обратно. ──
+const ds = [];            // всё, что получил переводчик
+let dsMode = 'ok';        // ok — работает; иначе код ответа, которым он откажет
+const TRANSLIT = { а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'e', ж: 'zh', з: 'z', и: 'i', й: 'y', к: 'k', л: 'l',
+  м: 'm', н: 'n', о: 'o', п: 'p', р: 'r', с: 's', т: 't', у: 'u', ф: 'f', х: 'h', ц: 'ts', ч: 'ch', ш: 'sh', щ: 'sch',
+  ъ: '', ы: 'y', ь: '', э: 'e', ю: 'yu', я: 'ya' };
+const translit = (s) => s.replace(/[А-Яа-яЁё]/g, (c) => {
+  const t = TRANSLIT[c.toLowerCase()];
+  return c === c.toLowerCase() ? t : t.charAt(0).toUpperCase() + t.slice(1);
+});
+const EN = (s) => `EN[${translit(s)}]`;     // что Claude получит вместо русской реплики s
+function fakeDeepSeek(opts, cb) {
+  const req = new EventEmitter();
+  let body = '';
+  req.write = (b) => { body += b; };
+  req.destroy = () => {};
+  req.end = () => {
+    const j = JSON.parse(body);
+    const sys = j.messages[0].content, user = j.messages[1].content;
+    const dir = sys.includes('from Russian to English') ? 'in' : sys.includes('from English to Russian') ? 'out' : '?';
+    ds.push({ dir, user, sys, body: j, headers: opts.headers, host: opts.hostname, path: opts.path });
+    const reply = (code, obj) => process.nextTick(() => {
+      const res = new EventEmitter(); res.statusCode = code; cb(res);
+      res.emit('data', Buffer.from(JSON.stringify(obj))); res.emit('end');
+    });
+    if (opts.headers.Authorization !== `Bearer ${DS_KEY}`) return reply(401, { error: { message: 'Authentication Fails' } });
+    if (dsMode !== 'ok') return reply(Number(dsMode), { error: { message: `фиктивный отказ ${dsMode}` } });
+    let out = dir === 'in' ? EN(user) : `RU[${user}]`;
+    if (dir === 'out' && user.includes('DROPTAG')) out = out.replace(/<x\d+\/>/g, '');   // переводчик «потерял» заглушку
+    reply(200, { choices: [{ message: { content: out }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 100, prompt_cache_hit_tokens: 60, prompt_cache_miss_tokens: 40, completion_tokens: 30 } });
+  };
+  return req;
+}
+
 https.request = (opts, cb) => {
+  if (opts.hostname === 'api.deepseek.com') return fakeDeepSeek(opts, cb);
   const req = new EventEmitter();
   let body = '';
   req.write = (b) => { body += b; };
@@ -62,7 +106,7 @@ https.request = (opts, cb) => {
       if (updates.length) deliver(); else waiting = deliver;
       return;
     }
-    if (method !== 'sendChatAction') calls.push({ method, payload, h: hours() });
+    if (method !== 'sendChatAction') calls.push({ method, payload, h: hours(), ...(method === 'sendDocument' ? { raw: body } : {}) });
     if (method === 'sendMessage') { const id = ++msgId; calls[calls.length - 1].id = id; return respond({ message_id: id }); }
     if (method === 'getMe') return respond({ username: 'testbot' });
     if (method === 'getFile') return respond({ file_path: `files/${payload.file_id}` });
@@ -501,6 +545,217 @@ require('../bot.js');
   check('таймаут не сработал', count('Превышен таймаут') === 0 && !after13.some((t) => t.includes('Остановлено')), after13);
   check('ответ пришёл', after13.some((t) => t.includes('Ответ на: очень долго: задача 16')), after13);
   check('в итоге указано время больше часа', after13.some((t) => /✅ 1 ч \d+ мин/.test(t)), after13);
+
+  out('14. Перевод через DeepSeek');
+  check('меню: есть /translate', calls.find((c) => c.method === 'setMyCommands').payload.commands.some((c) => c.command === 'translate'));
+  check('«что нового» рассказывает про перевод', texts().some((t) => t.includes('Бот обновлён') && t.includes('DEEPSEEK_API_KEY')));
+  check('ключ DeepSeek есть, а перевод выключен: DeepSeek не трогали', ds.length === 0, ds.length);
+  const sentFrom = (from) => calls.slice(from).filter((x) => x.method === 'sendMessage');
+  const textsFrom = (from) => calls.slice(from).map((x) => x.payload.text || '');
+  const lastStart = () => fakeLog().filter((x) => x.start).pop();
+  const sysPrompt = () => { const s = lastStart().start; return s[s.indexOf('--append-system-prompt') + 1] || ''; };
+  const statusOf = (from) => sentFrom(from).find((x) => x.payload.text.startsWith('🚀 Работаю…'));
+  let c14 = calls.length, d14 = ds.length;
+  b = fakeLog().length;
+
+  // экран и состояние
+  text('/translate');
+  await waitFor('экран перевода', () => textsFrom(c14).some((t) => t.includes('Перевод через DeepSeek')));
+  let tr14 = lastWith('Перевод через DeepSeek').payload;
+  check('экран: выключен, модель, кнопка включения', tr14.text.includes('<b>выключен</b>') && tr14.text.includes('deepseek-flash') &&
+        tr14.reply_markup.inline_keyboard.flat().some((x) => x.callback_data === 'tr:on'), tr14);
+  check('экран: прямо сказано, что уходит в DeepSeek', tr14.text.includes('Что уходит в DeepSeek') && !tr14.text.includes(DS_KEY));
+
+  // ключа нет: включить нечего, экран подсказывает, куда его вписать
+  const keys = { t: env.TRANSLATE_API_KEY, d: env.DEEPSEEK_API_KEY };
+  delete env.TRANSLATE_API_KEY; delete env.DEEPSEEK_API_KEY;
+  c14 = calls.length;
+  button('tr:on');
+  await waitFor('экран без ключа', () => textsFrom(c14).some((t) => t.includes('Перевод через DeepSeek')));
+  const nk = lastWith('Перевод через DeepSeek').payload;
+  check('без ключа: экран говорит, куда его вписать, кнопок нет',
+        nk.text.includes('<b>нет ключа</b>') && nk.text.includes('DEEPSEEK_API_KEY=') && !nk.reply_markup, nk);
+  c14 = calls.length;
+  text('/status');
+  await waitFor('статус без ключа', () => textsFrom(c14).some((t) => t.includes('Состояние')));
+  check('без ключа: статус так и пишет, перевод не включился',
+        lastWith('Состояние').payload.text.includes('нет ключа DeepSeek') && st().translate === false, st().translate);
+  env.TRANSLATE_API_KEY = keys.t; env.DEEPSEEK_API_KEY = keys.d;
+
+  // включение и обычная задача
+  button('tr:on');
+  await waitFor('включён', () => texts().some((t) => t.includes('Перевод включён')));
+  await sleepReal(20);
+  check('включение сохранено', st().translate === true, st().translate);
+  c14 = calls.length; b = fakeLog().length; d14 = ds.length;
+  text('привет, помоги');
+  await waitFor('ответ с переводом', () => textsFrom(c14).some((t) => t.includes(`RU[Answer to: ${EN('привет, помоги')}]`)));
+  let got = userAsks(b), dsT = ds.slice(d14);
+  check('Claude получил перевод, а не оригинал', got.length === 1 && got[0].msg === EN('привет, помоги'), got.map((x) => x.msg));
+  check('в DeepSeek два запроса: туда и обратно', dsT.length === 2 && dsT[0].dir === 'in' && dsT[1].dir === 'out', dsT.map((x) => x.dir));
+  check('туда ушёл оригинал слово в слово', dsT[0].user === 'привет, помоги', dsT[0].user);
+  check('запрос: адрес, модель, ключ в заголовке, размышления выключены',
+        dsT[0].host === 'api.deepseek.com' && dsT[0].path === '/chat/completions' && dsT[0].body.model === 'deepseek-flash' &&
+        dsT[0].body.thinking.type === 'disabled' && dsT[0].headers.Authorization === `Bearer ${DS_KEY}`, dsT[0]);
+  check('Claude просят отвечать по-английски, правила тоже по-английски',
+        sysPrompt().includes('machine-translated') && sysPrompt().includes('Be brief') && !sysPrompt().includes('Отвечай кратко'), sysPrompt());
+  check('ключ переводчика до Claude не доходит', lastStart().leak === false, lastStart());
+  const ans14 = [...sentFrom(c14)].reverse().find((x) => x.payload.text.includes('RU[Answer to'));
+  check('в итоге значок перевода и кнопка оригинала', ans14.payload.text.includes('• 🌐') &&
+        ans14.payload.reply_markup.inline_keyboard.flat().some((x) => x.callback_data === 'act:orig'), ans14.payload);
+  const st14 = statusOf(c14);
+  check('в статусе значок перевода', st14.payload.text.includes('• 🌐'), st14.payload.text);
+  check('пока переводится ответ — статус «Перевожу», потом убран',
+        calls.slice(c14).some((x) => x.method === 'editMessageText' && x.payload.message_id === st14.id && x.payload.text.includes('Перевожу ответ')) &&
+        calls.slice(c14).some((x) => x.method === 'deleteMessage' && x.payload.message_id === st14.id), calls.slice(c14).map((x) => x.method));
+  c14 = calls.length;
+  button('act:orig');
+  await waitFor('оригинал', () => textsFrom(c14).some((t) => t.includes('Оригинал ответа')));
+  const orig = lastWith('Оригинал ответа').payload.text;
+  check('«Оригинал» — английский ответ до перевода', orig.includes(`Answer to: ${EN('привет, помоги')}`) && !orig.includes('RU['), orig);
+
+  // код, пути и цитаты не покидают сервер
+  c14 = calls.length; b = fakeLog().length; d14 = ds.length;
+  text('выполни `rm -rf /tmp/x` и покажи CODE, кнопку назови «Сохранить» и всё');
+  await waitFor('ответ с кодом', () => textsFrom(c14).some((t) => t.includes('systemctl restart claude-tg-bot')));
+  dsT = ds.slice(d14); got = userAsks(b);
+  check('код, пути, команды и цитаты в DeepSeek не ушли',
+        dsT.every((x) => !/rm -rf|Сохранить|systemctl|\/opt\/app|\/tmp\/x/.test(x.user)), dsT.map((x) => x.user));
+  check('вместо них заглушки', dsT[0].user === 'выполни <x1/> и покажи CODE, кнопку назови <x2/> и всё', dsT[0].user);
+  check('Claude получил код и цитату на месте', got[0].msg.startsWith('EN[') && got[0].msg.includes('`rm -rf /tmp/x`') &&
+        got[0].msg.includes('«Сохранить»'), got[0].msg);
+  const shownC = [...sentFrom(c14)].reverse().find((x) => x.payload.text.includes('systemctl restart'));
+  check('в ответе код дословно: и блок, и строка', shownC.payload.text.includes('sudo systemctl restart claude-tg-bot') &&
+        shownC.payload.text.includes('ls -la /opt/app'), shownC.payload.text);
+  check('текст до блока кода и после него переводится отдельно', dsT.filter((x) => x.dir === 'out').length === 2, dsT.map((x) => x.dir));
+
+  // английский запрос переводить незачем
+  c14 = calls.length; b = fakeLog().length; d14 = ds.length;
+  text('run ls');
+  await waitFor('ответ на английский запрос', () => textsFrom(c14).some((t) => t.includes('RU[Answer to: run ls]')));
+  check('без кириллицы «туда» не переводим, ответ — переводим',
+        ds.slice(d14).length === 1 && ds[d14].dir === 'out' && userAsks(b)[0].msg === 'run ls', ds.slice(d14).map((x) => x.dir));
+
+  // переводчик потерял заглушку — этому тексту веры нет
+  c14 = calls.length; d14 = ds.length;
+  text('покажи DROPTAG');
+  await waitFor('ответ с предупреждением', () => textsFrom(c14).some((t) => t.includes('Перевод не сработал')));
+  const warn14 = lastWith('Перевод не сработал').payload;
+  check('потеряна заглушка: английский оригинал и честное предупреждение',
+        warn14.text.includes('ответ остался на английском') && warn14.text.includes('🌐⚠️') &&
+        warn14.text.includes('<code>config.json</code>') && !warn14.text.includes('RU['), warn14.text);
+  check('неудачный ответ — один запрос, без повторов', ds.slice(d14).filter((x) => x.dir === 'out').length === 1);
+  check('показывать «Оригинал» нечего — кнопки нет', !warn14.reply_markup.inline_keyboard.flat().some((x) => x.callback_data === 'act:orig'));
+
+  // длинный ответ: кусками, параллельно, в правильном порядке
+  c14 = calls.length; d14 = ds.length;
+  text('LONG ответ пожалуйста');
+  await waitFor('файл с ответом', () => calls.slice(c14).some((x) => x.method === 'sendDocument'));
+  const doc14 = calls.slice(c14).find((x) => x.method === 'sendDocument');
+  const dsL = ds.slice(d14).filter((x) => x.dir === 'out');
+  check('длинный ответ ушёл на перевод кусками', dsL.length >= 3 && dsL.every((x) => x.user.length <= 2600), dsL.map((x) => x.user.length));
+  const where = [1, 2, 3, 4, 5, 6, 7, 8].map((i) => doc14.raw.indexOf(`P${i}:`));
+  check('куски склеены по порядку, ничего не потеряно', where.every((p, i) => p > 0 && (i === 0 || p > where[i - 1])), where);
+
+  // очередь: несколько сообщений — один перевод
+  b = fakeLog().length; d14 = ds.length;
+  text('SLOWQ первая');
+  await waitFor('первая ушла', () => userAsks(b).some((x) => x.msg === EN('SLOWQ первая')));
+  text('вторая'); text('третья');
+  await waitFor('ответ на очередь', () => texts().some((t) => t.includes(`Answer to: ${EN('вторая\n\nтретья')}`.slice(0, 40))));
+  const dsQ = ds.slice(d14).filter((x) => x.dir === 'in');
+  check('очередь переводится одним запросом', dsQ.length === 2 && dsQ[1].user === 'вторая\n\nтретья', dsQ.map((x) => x.user));
+  check('Claude получил объединённый перевод', userAsks(b)[1].msg === EN('вторая\n\nтретья'), userAsks(b).map((x) => x.msg));
+
+  // голосовое: переводятся слова, пометка бота остаётся
+  b = fakeLog().length;
+  msg({ voice: { file_id: 'v14', duration: 5, file_size: 5000 } });
+  await waitFor('голосовое ушло', () => userAsks(b).length >= 1);
+  const voice14 = userAsks(b)[0].msg;
+  check('голосовое: слова переведены, пометка бота как была', voice14.startsWith(EN('Привет, это голосовое.')) &&
+        voice14.includes('[🎙 Голосовое 0:05'), voice14);
+  await waitFor('ответ на голосовое', () => texts().some((t) => t.includes(`RU[Answer to: ${EN('Привет, это голосовое.')}`.slice(0, 40))));
+
+  // экраны
+  c14 = calls.length;
+  text('/status');
+  await waitFor('статус', () => textsFrom(c14).some((t) => t.includes('Состояние')));
+  check('статус: перевод включён', lastWith('Состояние').payload.text.includes('Перевод: <b>включён</b>'));
+  c14 = calls.length;
+  text('/translate');
+  await waitFor('экран с цифрами', () => textsFrom(c14).some((t) => t.includes('Всего:')));
+  tr14 = lastWith('Всего:').payload;
+  check('экран: включён, расход и кнопки', tr14.text.includes('<b>включён</b>') && /Всего: <b>\d+<\/b>/.test(tr14.text) && tr14.text.includes('≈') &&
+        ['tr:off', 'tr:test'].every((d) => tr14.reply_markup.inline_keyboard.flat().some((x) => x.callback_data === d)), tr14.text);
+  check('расход переводчика учтён', st().tr.n >= 15 && st().tr.cost > 0 && st().tr.hit > 0, st().tr);
+  c14 = calls.length;
+  button('tr:test');
+  await waitFor('проверка', () => textsFrom(c14).some((t) => t.includes('Проверка перевода')));
+  const probe14 = lastWith('Проверка перевода').payload.text;
+  check('проверка: оба направления прошли', (probe14.match(/✅/g) || []).length === 2 && probe14.includes('RU → EN') && probe14.includes('EN → RU'), probe14);
+
+  // сбой переводчика: задача не пропадает, об этом честно сказано, после трёх сбоев — пауза
+  dsMode = '500';
+  const MIXED = 'and also with a long english tail';
+  c14 = calls.length; b = fakeLog().length; d14 = ds.length;
+  text(`сломай ${MIXED}`);
+  await waitFor('ответ при сбое', () => textsFrom(c14).some((t) => t.includes('Перевод не сработал')));
+  const f14 = lastWith('Перевод не сработал').payload;
+  check('сбой: запрос ушёл как есть', userAsks(b)[0].msg === `сломай ${MIXED}`, userAsks(b).map((x) => x.msg));
+  check('сбой: английский оригинал и оба предупреждения', f14.text.includes('запрос ушёл без перевода') &&
+        f14.text.includes('ответ остался на английском') && f14.text.includes(`Answer to: сломай ${MIXED}`.slice(0, 40)), f14.text);
+  check('на временный сбой один повтор', ds.slice(d14).filter((x) => x.dir === 'in').length === 2, ds.slice(d14).map((x) => x.dir));
+  text(`снова ${MIXED}`);
+  await waitFor('второй сбой', () => textsFrom(c14).filter((t) => t.includes('Перевод не сработал')).length >= 2);
+  // первая задача: 2 попытки туда и 2 обратно, вторая: 2 попытки туда, и это третий сбой подряд — «обратно» уже не пробуем
+  check('три сбоя подряд — переводчика на время не трогаем', ds.slice(d14).length === 6 && ds.slice(d14).filter((x) => x.dir === 'out').length === 2,
+        ds.slice(d14).map((x) => x.dir));
+  dsMode = 'ok';
+  await sleepReal(90);   // 3 минуты по ускоренным часам бота
+  c14 = calls.length; b = fakeLog().length; d14 = ds.length;
+  text('привет после паузы');
+  await waitFor('перевод ожил', () => textsFrom(c14).some((t) => t.includes(`RU[Answer to: ${EN('привет после паузы')}]`)));
+  check('через две минуты переводчик снова в деле', ds.slice(d14).length === 2 && !textsFrom(c14).some((t) => t.includes('Перевод не сработал')));
+
+  // деньги кончились: владельцу пишем сами и один раз, десять минут переводчика не трогаем
+  dsMode = '402';
+  c14 = calls.length; d14 = ds.length;
+  text(`деньги ${MIXED}`);
+  await waitFor('сообщение про деньги', () => textsFrom(c14).some((t) => t.includes('закончились деньги')));
+  await waitFor('ответ на 402', () => textsFrom(c14).some((t) => t.includes('Перевод не сработал')));
+  check('402: один запрос — без повторов и без «обратно»', ds.slice(d14).length === 1 && ds[d14].dir === 'in', ds.slice(d14).map((x) => x.dir));
+  d14 = ds.length;
+  text(`ещё ${MIXED}`);
+  await waitFor('вторая задача', () => textsFrom(c14).filter((t) => t.includes('Перевод не сработал')).length >= 2);
+  check('на паузе после отказа по деньгам переводчика не трогаем', ds.length === d14, ds.slice(d14).map((x) => x.dir));
+  c14 = calls.length;
+  text('/translate');
+  await waitFor('экран после отказа', () => textsFrom(c14).some((t) => t.includes('Последний сбой')));
+  const tr15 = lastWith('Последний сбой').payload.text;
+  check('экран: причина сбоя и пауза', tr15.includes('DeepSeek 402') && tr15.includes('на паузе'), tr15);
+  await sleepReal(340);   // десять минут по ускоренным часам бота
+  c14 = calls.length;
+  text(`и снова ${MIXED}`);
+  await waitFor('третья задача', () => textsFrom(c14).some((t) => t.includes('Перевод не сработал')));
+  check('после паузы пробует снова, но о деньгах владельцу второй раз не пишет',
+        ds.slice(d14).length === 1 && texts().filter((t) => t.includes('закончились деньги')).length === 1, ds.slice(d14).map((x) => x.dir));
+  dsMode = 'ok';
+
+  // выключение: всё по-русски, как раньше
+  c14 = calls.length; b = fakeLog().length; d14 = ds.length;
+  button('tr:off');
+  await waitFor('выключен', () => texts().some((t) => t.includes('Перевод выключен')));
+  text('привет снова');
+  await waitFor('русский ответ', () => textsFrom(c14).some((t) => t.includes('Ответ на: привет снова')));
+  check('выключен: Claude получил оригинал, DeepSeek не трогали', userAsks(b)[0].msg === 'привет снова' && ds.length === d14, ds.slice(d14));
+  check('выключен: инструкции Claude снова русские', sysPrompt().includes('Отвечай кратко') && !sysPrompt().includes('machine-translated'), sysPrompt());
+  check('выключен: в ответе нет значка перевода',
+        !textsFrom(c14).some((t) => t.includes('Ответ на: привет снова') && t.includes('🌐')));
+  await sleepReal(20);
+  check('выключение сохранено', st().translate === false, st().translate);
+  check('сравнение цены задач: с переводом и без', st().trCmp.on.n >= 8 && st().trCmp.off.n >= 1, st().trCmp);
+  check('ключи не попали ни в журнал бота, ни в состояние',
+        [DS_KEY, OLD_KEY].every((k) => !logs.some((l) => l.includes(k)) && !fs.readFileSync(env.STATE_FILE, 'utf8').includes(k)));
 
   out(`\nИтог: ${ok} ✓, ${bad} ✗`);
   process.exit(bad ? 1 : 0);

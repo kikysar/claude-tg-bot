@@ -8,7 +8,23 @@ const sid = at('--session-id') || at('--resume') || 'sid';
 const log = (o) => fs.appendFileSync(LOG, JSON.stringify(o) + '\n');
 log({ start: args, env: {
   bg: process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, wf: process.env.CLAUDE_CODE_DISABLE_WORKFLOWS,
-  cron: process.env.CLAUDE_CODE_DISABLE_CRON, ep: process.env.CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS } });
+  cron: process.env.CLAUDE_CODE_DISABLE_CRON, ep: process.env.CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS },
+  leak: process.env.DEEPSEEK_API_KEY !== undefined || process.env.TRANSLATE_API_KEY !== undefined });   // ключ переводчика до Claude доходить не должен
+
+// Включён перевод — бот просит отвечать по-английски; так же отвечает и этот двойник
+const english = at('--append-system-prompt').includes('machine-translated');
+function answerFor(text) {
+  if (!english) return `Ответ на: ${text.slice(0, 40)}`;
+  const head = `Answer to: ${text.slice(0, 40)}`;
+  if (text.includes('CODE')) {
+    return `${head}\n\nRun \`ls -la /opt/app\` first.\n\n\`\`\`bash\nsudo systemctl restart claude-tg-bot\n\`\`\`\n\nThen check the log.`;
+  }
+  if (text.includes('DROPTAG')) return `${head}\n\nOpen \`config.json\` now. DROPTAG`;
+  if (text.includes('LONG')) {
+    return [head, ...Array.from({ length: 8 }, (_, i) => `P${i + 1}: ${'word '.repeat(170).trim()}.`)].join('\n\n');
+  }
+  return head;
+}
 
 let ctx = 30000;
 let buf = '';
@@ -54,7 +70,8 @@ async function handle(msg) {
     out({ type: 'assistant', session_id: sid, message: { model: 'claude-opus-5-5', usage: usage(),
       content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls -la' } }] } });
     // «очень долго» — больше полутора часов по ускоренным часам бота (2,6 с × 2000)
-    await sleep(text.includes('очень долго') ? 2600 : text.includes('долго') ? 400 : 15);
+    // SLOWQ — то же «долго», но латиницей: русское слово перевод на английский заменил бы
+    await sleep(text.includes('очень долго') ? 2600 : text.includes('долго') || text.includes('SLOWQ') ? 400 : 15);
   }
   const u = usage();
   out({ type: 'assistant', session_id: sid, message: { model: 'claude-opus-5-5', usage: u,
@@ -67,6 +84,6 @@ async function handle(msg) {
   }
   // в итоге хода — сумма по обращениям, как у настоящего CLI
   out({ type: 'result', subtype: 'success', is_error: false, session_id: sid, total_cost_usd: 0.01,
-    result: ping ? '.' : `Ответ на: ${text.slice(0, 40)}`,
+    result: ping ? '.' : answerFor(text),
     usage: { ...u, cache_read_input_tokens: u.cache_read_input_tokens * (ping ? 1 : 2) } });
 }
