@@ -2,13 +2,16 @@
 // время ускорено в SPEED раз. Запуск: node harness.js (VERBOSE=1 — с журналом бота).
 //   BOT_FILE=путь   — проверить другой bot.js (по умолчанию ../bot.js)
 //   SPEED=1         — не ускорять время
-//   BOOTCASE=имя    — короткий прогон только про запуск бота (ok, auth, key, limit, fresh, off, same, hang, lowmem)
+//   BOOTCASE=имя    — короткий прогон только про запуск бота (ok, auth, key, limit, fresh, off, same, hang, lowmem, ...);
+//                     про модели Google: gemini (весь путь), gemini-again, gemini-nokey, gemini-down
 //   REALCLI=путь    — переводчик идёт через НАСТОЯЩИЙ claude (путь к нему), всё остальное — макеты
 const path = require('path'), fs = require('fs'), os = require('os');
 const EventEmitter = require('events');
 const { Readable, PassThrough, Writable } = require('stream');
 const cp = require('child_process');
 const https = require('https');
+const http = require('http');
+const crypto = require('crypto');
 
 const SPEED = Number(process.env.SPEED) || 2000;
 let timerSpeed = SPEED;      // во сколько раз ускорены таймеры; последняя проверка на время останавливает их сама
@@ -64,8 +67,17 @@ const BOOT_STATE = {
   pinned: { translate: true, announced: '2026-10-12.1' },
   othermodel: { translate: true, announced: '2026-10-12.1' },
   fallback: { translate: true, announced: '2026-10-12.1' },
+  // Модели Google. Проверка переводчика при запуске тут ни к чему (trOkAt свежий): разговор не о ней
+  gemini: { translate: true, announced: '2026-10-12.1', trOkAt: Date.now() },
+  'gemini-again': { translate: true, announced: BOT_VERSION, trAnnounced: true, gemAnnounced: true, trOkAt: Date.now() },
+  'gemini-nokey': { translate: true, announced: '2026-10-12.1', trOkAt: Date.now(), model: 'gemini-3.1-pro-preview' },
+  'gemini-down': { translate: true, announced: '2026-10-12.1', trOkAt: Date.now() },
 };
 if (BOOT && !BOOT_STATE[BOOT]) { console.log(`Нет такого BOOTCASE: ${BOOT}`); process.exit(2); }
+// Ключи Google из окружения разработчика проверку не касаются: модели Gemini появляются только в gemini-прогонах и только с поддельным Google
+for (const k of ['GEMINI_KEY_FILE', 'GOOGLE_APPLICATION_CREDENTIALS', 'GEMINI_LOCATION', 'GEMINI_MODELS', 'GEMINI_DAILY_USD', 'GEMINI_LEVEL',
+                 'GEMINI_COMPACT_WINDOW', 'GEMINI_VERTEX_BASE', 'GEMINI_TOKEN_URL', 'ENABLE_TOOL_SEARCH', 'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+                 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC']) delete env[k];
 fs.mkdirSync(path.dirname(env.STATE_FILE), { recursive: true });
 fs.writeFileSync(env.STATE_FILE, JSON.stringify(BOOT ? BOOT_STATE[BOOT] : REAL_BIN ? { translate: true, announced: BOT_VERSION } : { translate: false }));
 if (BOOT === 'off') env.TRANSLATE_BACKEND = 'off';
@@ -393,7 +405,61 @@ if (BOOT === 'othermodel') env.TRANSLATE_CLI_MODEL = 'sonnet';            // м�
 if (BOOT === 'lowmem') memInfo(100);
 if (BOOT) timerSpeed = 200;
 
-require(BOT_FILE);
+// ── Модели Google: поддельные вход по ключу сервисного аккаунта и Vertex AI. Мост у бота настоящий (в этом же процессе),
+// только ходит по http на этот сервер. Запрос к Vertex с вопросом «ДОРОГО» показывает большой объём ввода — для проверки потолка расхода. ──
+const gemFake = { tokens: 0, jwtOk: [], reqs: [], mode: 'ok' };
+const GEM_PROBE = 'Reply with the single word OK.';       // короткий пробный запрос моста
+async function startFakeGoogle() {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const SA = 'bot@test-proj.iam.gserviceaccount.com';
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (req.url === '/token') {
+        gemFake.tokens++;
+        const [h, c, s] = (new URLSearchParams(raw).get('assertion') || '').split('.');
+        let good = false;
+        try {
+          const claim = JSON.parse(Buffer.from(c, 'base64url').toString());
+          good = crypto.createVerify('RSA-SHA256').update(`${h}.${c}`).verify(publicKey, Buffer.from(s, 'base64url')) &&
+            claim.iss === SA && claim.scope === 'https://www.googleapis.com/auth/cloud-platform';
+        } catch {}
+        gemFake.jwtOk.push(good);
+        res.writeHead(good ? 200 : 400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(good ? { access_token: `tok-${gemFake.tokens}`, expires_in: 3600 } : { error: 'invalid_grant' }));
+      }
+      const m = /^\/v1\/projects\/([^/]+)\/locations\/([^/]+)\/publishers\/google\/models\/([^:]+):(\w+)/.exec(req.url);
+      if (!m) { res.writeHead(404); return res.end('no'); }
+      let body = {}; try { body = JSON.parse(raw); } catch {}
+      const ask = (((body.contents || []).slice(-1)[0] || {}).parts || []).map((p) => p.text || '').join('\n');
+      gemFake.reqs.push({ project: m[1], location: m[2], model: m[3], method: m[4], auth: req.headers.authorization || '', ask, body });
+      if (gemFake.mode === 'deny') {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify([{ error: { code: 403, status: 'PERMISSION_DENIED', message: 'Vertex AI API has not been used in project test-proj before or it is disabled.' } }]));
+      }
+      const probe = ask === GEM_PROBE;
+      const usage = { promptTokenCount: probe ? 12 : ask.includes('ДОРОГО') ? 190000 : 10000, cachedContentTokenCount: 0,
+        candidatesTokenCount: probe ? 2 : 100, thoughtsTokenCount: 0 };
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write(`data: ${JSON.stringify({ candidates: [{ content: { role: 'model', parts: [{ text: probe ? 'OK' : `Gemini says: ${ask.slice(0, 40)}` }] } }] })}\r\n\r\n`);
+      res.end(`data: ${JSON.stringify({ candidates: [{ content: { role: 'model', parts: [{ text: '' }] }, finishReason: 'STOP' }], usageMetadata: usage })}\r\n\r\n`);
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const keyFile = path.join(tmp, 'gemini-key.json');
+  fs.writeFileSync(keyFile, JSON.stringify({ type: 'service_account', project_id: 'test-proj', client_email: SA,
+    private_key: privateKey.export({ type: 'pkcs8', format: 'pem' }), token_uri: `${origin}/token` }), { mode: 0o600 });
+  env.GEMINI_KEY_FILE = BOOT === 'gemini-nokey' ? path.join(tmp, 'no-such-key.json') : keyFile;     // в nokey ключа нет на месте
+  env.GEMINI_VERTEX_BASE = origin; env.GEMINI_TOKEN_URL = `${origin}/token`;
+  env.GEMINI_DAILY_USD = '0.3';
+  if (BOOT === 'gemini-down') gemFake.mode = 'deny';
+}
+
+if (BOOT.startsWith('gemini')) startFakeGoogle().then(() => require(BOT_FILE));
+else require(BOT_FILE);
 
 // ── Короткие прогоны про запуск бота: как он себя ведёт, пока владелец ничего не нажимал ──
 const argOf = (run, f) => run.args[run.args.indexOf(f) + 1];
@@ -412,6 +478,10 @@ async function bootCase() {
   };
   const state0 = () => { try { return st(); } catch { return {}; } };
   const sysP = () => { const s = fakeLog().filter((x) => x.start).pop().start; return s[s.indexOf('--append-system-prompt') + 1] || ''; };
+  const lastStart = () => fakeLog().filter((x) => x.start).pop();                       // последний запуск Claude Code: аргументы, окружение, вход
+  const startsFrom = (b) => fakeLog().slice(b).filter((x) => x.start);
+  const flagOf = (args, f) => args[args.indexOf(f) + 1];
+  const keysOf = (c) => ((c.payload.reply_markup || {}).inline_keyboard || []).flat();   // кнопки экрана
   await waitFor('бот поднялся', () => waiting !== null, 20000);
   await sleepReal(40);
   out(`Запуск бота, случай «${BOOT}»`);
@@ -493,6 +563,277 @@ async function bootCase() {
     check('перевод ещё не объявляли — объявлен один раз, с названием переводчика',
       sent().filter((t) => t.includes('Перевод включён</b> (Haiku по подписке)')).length === 1, sent());
     check('при запуске пробный перевод удался', trRuns.length === 1 && probeLog(true), logs.filter((l) => l.includes('Проверка')));
+  } else if (BOOT === 'gemini') {
+    // Весь путь: ключ Google → мост → модель в меню → общая беседа с Claude → расход и потолок → возврат на Claude.
+    // Мост настоящий и ходит на поддельный Vertex; Claude Code поддельный, но в режиме Gemini тоже ходит на мост по HTTP.
+    const PRO = 'gemini-3.1-pro-preview', LITE = 'gemini-3.1-flash-lite';
+    const cwd = () => st().activeProject;
+    const gemLog = (s) => logs.some((l) => l.includes(s));
+    const spendFile = () => JSON.parse(fs.readFileSync(path.join(path.dirname(env.STATE_FILE), 'gemini', 'spend.json'), 'utf8'));
+    const statusText = async () => {
+      const n = texts().filter((t) => t.includes('Состояние')).length;
+      text('/status');
+      await waitFor('статус', () => texts().filter((t) => t.includes('Состояние')).length > n);
+      return lastWith('Состояние').payload.text;
+    };
+    const limitsText = async () => {
+      const n = texts().filter((t) => t.includes('Использование')).length;
+      text('/limits');
+      await waitFor('лимиты', () => texts().filter((t) => t.includes('Использование')).length > n);
+      return lastWith('Использование').payload.text;
+    };
+
+    out('1. Запуск');
+    check('мост Gemini поднялся вместе с ботом', gemLog('Мост Gemini запущен'), logs.filter((l) => l.includes('Gemini')));
+    await waitFor('проверка связи с Google при запуске', () => gemLog('Проверка связи с Google при запуске'), 10000);
+    const bootReq = gemFake.reqs[0] || {};
+    check('при запуске один настоящий короткий запрос к Pro, и он удался',
+      gemFake.reqs.length === 1 && bootReq.model === PRO && bootReq.method === 'streamGenerateContent' && bootReq.ask === GEM_PROBE &&
+      logs.some((l) => l.includes('Проверка связи с Google при запуске') && l.includes('"ok":true')), { reqs: gemFake.reqs.map((r) => [r.model, r.ask]), logs: logs.filter((l) => l.includes('Google')) });
+    check('вход по ключу: подпись верна, токен в запросе, проект из ключа, регион global',
+      gemFake.jwtOk.length >= 1 && gemFake.jwtOk.every(Boolean) && /^Bearer tok-\d+$/.test(bootReq.auth) && bootReq.project === 'test-proj' && bootReq.location === 'global', { jwt: gemFake.jwtOk, req: bootReq.auth });
+    await waitFor('объявление про Google', () => sent().some((t) => t.includes('Модели Google подключены')), 10000);
+    const ann = sent().find((t) => t.includes('Модели Google подключены'));
+    check('«что нового» — первым, объявление про Google одно и после него', first.includes('Бот обновлён') && sent().filter((t) => t.includes('Модели Google подключены')).length === 1 && sent().indexOf(ann) > 0, sent());
+    check('в объявлении: пять моделей, «не подписка», цена Pro, потолок на сутки',
+      ['Gemini 3.1 Pro', 'Gemini 3.7 Flash', 'Gemini 3.5 Flash', 'Gemini 3 Flash', 'Gemini 3.1 Flash-Lite'].every((n) => ann.includes(n)) &&
+      ann.includes('не подписка Claude') && ann.includes('$2 / $12') && ann.includes('потолок на сутки $0.30'), ann);
+    check('в объявлении нет секретов', !/PRIVATE KEY|client_email|bot@test-proj|tok-\d/.test(ann), ann);
+    await sleepReal(60);
+    check('в состоянии: Google объявлен', st().gemAnnounced === true, st());
+    check('перевод Claude при этом включён, объявляется как раньше', st().translate === true && first.includes('Перевод включён'), first);
+
+    out('2. Меню моделей');
+    text('/model');
+    await waitFor('экран модели', () => texts().some((t) => t.includes('Модель и режим')));
+    const mp = lastWith('Модель и режим'), mk = keysOf(mp);
+    check('в меню пять моделей Google, у каждой своя кнопка',
+      [PRO, 'gemini-3.7-flash', 'gemini-3.5-flash', 'gemini-3-flash-preview', LITE].every((id) => mk.some((b) => b.callback_data === `m:${id}`)), mk.map((b) => b.callback_data));
+    check('Claude в меню остался, Opus отмечен', mk.some((b) => b.callback_data === 'm:opus' && b.text.startsWith('✅')) && mk.some((b) => b.callback_data === 'm:sonnet' && !b.text.startsWith('✅')), mk.map((b) => b.text));
+    check('есть кнопка проверки связи с Google', mk.some((b) => b.callback_data === 'act:gemtest'));
+    check('под меню: Vertex, общая беседа, расход с потолком, цены (оценочные — со знаком ≈)',
+      mp.payload.text.includes('Vertex AI') && mp.payload.text.includes('Беседа общая') && mp.payload.text.includes('из потолка $0.30') &&
+      mp.payload.text.includes('Gemini 3.1 Pro $2 / $12') && mp.payload.text.includes('Gemini 3.5 Flash ≈$0.75 / $3.75'), mp.payload.text);
+    const n0 = gemFake.reqs.length;
+    button('act:gemtest');
+    await waitFor('отчёт о проверке связи', () => texts().some((t) => t.includes('Проверка связи с Google')), 10000);
+    const rep = lastWith('Проверка связи с Google').payload.text;
+    check('кнопка проверки: Pro и Flash-Lite ответили, проект назван', rep.includes('✅ Gemini 3.1 Pro') && rep.includes('✅ Gemini 3.1 Flash-Lite') && !rep.includes('❌') && rep.includes('test-proj'), rep);
+    check('обе проверки дошли до Vertex', gemFake.reqs.slice(n0).map((r) => r.model).sort().join() === `${LITE},${PRO}`, gemFake.reqs.slice(n0).map((r) => r.model));
+
+    out('3. Сначала работает Claude');
+    const t0 = await task('привет, помоги');
+    const sid = st().sessions[cwd()];
+    const c0 = lastStart();
+    check('Claude получил перевод, владелец увидел русский ответ', t0.got === EN('привет, помоги') && t0.shown.some((x) => x.includes(RUC(`Answer to: ${EN('привет, помоги')}`))), t0);
+    check('вход Claude — прежний: токен подписки, ключ и чужой провайдер на месте, моста нет',
+      c0.auth.oauth && c0.auth.apiKey && c0.auth.base === 'https://proxy.invalid' && c0.auth.use.join() === 'CLAUDE_CODE_USE_BEDROCK' && c0.auth.toolSearch === undefined && c0.auth.window === undefined, c0.auth);
+    check('у Claude WebSearch разрешён, модель — Opus без [1m]', !flagOf(c0.start, '--disallowed-tools').split(',').includes('WebSearch') && flagOf(c0.start, '--model') === 'opus', c0.start);
+    check('беседа начата, номер запомнен', Boolean(sid) && c0.start.includes('--session-id'), { sid, start: c0.start });
+
+    out('4. Переключение на Gemini');
+    button(`m:${PRO}`);
+    await waitFor('модель выбрана', () => texts().some((t) => t.includes('Модель: <b>Gemini 3.1 Pro</b>')));
+    const sw = lastWith('Модель: <b>Gemini 3.1 Pro</b>').payload.text;
+    check('ответ на выбор: беседа общая, цена за миллион, расход с потолком, как вернуться',
+      sw.includes('Беседа общая') && sw.includes('$2 / $12') && sw.includes('из потолка $0.30') && sw.includes('Вернуться на Claude — /model') && /загрузит беседу заново \(\d+к токенов\)/.test(sw), sw);
+    check('модель записана, процесс Claude остановлен', st().model === PRO && gemLog('Останавливаю процесс Claude: сменилась модель'), st().model);
+    const bG = fakeLog().length, cG = calls.length;
+    const g1 = await task('что мы сейчас делаем?');
+    const gs = startsFrom(bG);
+    const G1 = gs[0] || { start: [], auth: {} };
+    check('поднят один процесс; модель Google с суффиксом [1m] — окно в миллион токенов', gs.length === 1 && flagOf(G1.start, '--model') === `${PRO}[1m]`, G1.start);
+    check('беседа та же: --resume с прежним номером, новая не начата', flagOf(G1.start, '--resume') === sid && !G1.start.includes('--session-id'), { want: sid, start: G1.start });
+    const dis = flagOf(G1.start, '--disallowed-tools').split(',');
+    check('закрыты субагенты, а WebSearch открыт (мост отвечает на web_search через поиск Google)', ['Agent', 'Task', 'Workflow'].every((x) => dis.includes(x)) && !dis.includes('WebSearch'), dis);
+    check('вход — мост: адрес 127.0.0.1, свой секрет; ключ API, вход по подписке и чужой провайдер убраны',
+      G1.auth.base.startsWith('http://127.0.0.1:') && G1.auth.token >= 32 && !G1.auth.apiKey && !G1.auth.oauth && G1.auth.use.length === 0, G1.auth);
+    check('отложенные инструменты выключены, окно сжатия 200 тыс., трафик к Anthropic выключен', G1.auth.toolSearch === 'false' && G1.auth.window === '200000' && G1.auth.nonEss === '1', G1.auth);
+    check('перевода нет: Gemini получил русский как написано, инструкции русские',
+      g1.got === 'что мы сейчас делаем?' && sysP().includes('Отвечай кратко') && !sysP().includes('machine-translated'), { got: g1.got, sys: sysP().slice(0, 80) });
+    check('вопрос дошёл до Vertex от нужной модели с нужным токеном',
+      gemFake.reqs.some((r) => r.model === PRO && r.ask === 'что мы сейчас делаем?' && /^Bearer tok-\d+$/.test(r.auth)), gemFake.reqs.slice(-2).map((r) => [r.model, r.ask]));
+    check('владелец увидел ответ Gemini; в строке итога — модель и цена задачи по прайсу Pro: 10 тыс. × $2 + 100 × $12 = $0.021',
+      g1.shown.some((x) => x.includes('Gemini says: что мы сейчас делаем?') && x.includes('🔷 Gemini 3.1 Pro') && x.includes('💵 $0.021') && !x.includes('🌐')), g1.shown);
+    check('в статусе задачи: история грузится из файла, модель названа',
+      calls.slice(cG).some((c) => c.method === 'sendMessage' && (c.payload.text || '').includes('🧵 загружаю историю • Gemini 3.1 Pro')), calls.slice(cG).map((c) => c.payload.text));
+    const sp1 = spendFile();
+    check('расход моста записан на диск: Pro — 0.0212 + две пробы', Math.abs(sp1.byModel[PRO].usd - (0.0212 + 2 * 0.000048)) < 1e-9 && sp1.calls === 4, sp1);
+    check('цену Claude Code за чужую модель (0,9) бот не учёл; задача посчитана', Math.abs(st().usage.total.cost - 0.01) < 1e-9 && st().usage.total.tasks === 2 && st().lastCtx === 10000, st().usage.total);
+    check('эту задачу не считали задачей переводчика и сравнения «с переводом / без»', !st().trCmp || st().trCmp.off.n === 0 && st().trCmp.on.n === 1, st().trCmp);
+    const stG = await statusText();
+    check('статус: модель Google, проект, расход с потолком, процесс в памяти',
+      stG.includes('Модель: <b>Gemini 3.1 Pro</b>') && stG.includes('Gemini через Vertex AI') && stG.includes('<code>test-proj</code>') &&
+      stG.includes('💵 Расход: сегодня <b>$0.021</b> из потолка $0.30') && stG.includes('Беседа в памяти процесса'), stG);
+    check('статус: перевод «не нужен», про прогрев и кэш Claude ни слова, контекст из окна 200к',
+      stG.includes('Перевод: <b>не нужен</b>') && !stG.includes('Прогрев:') && !stG.includes('Кэш тёплый') && stG.includes('🟢 Контекст: <b>10к</b> из 200к (5%)'), stG);
+    const limG = await limitsText();
+    check('/limits: блок Gemini — сегодня с потолком, всего, по моделям; «это не лимит подписки»',
+      limG.includes('🔷 <b>Gemini (Vertex AI)</b>') && limG.includes('Сегодня: <b>$0.021</b> из потолка $0.30 • 4 обращений') && limG.includes('Всего: $0.021 • 4 обращений') &&
+      limG.includes('Gemini 3.1 Pro — $0.021') && limG.includes('Gemini 3.1 Flash-Lite — $0.000') && limG.includes('деньги Google Cloud'), limG);
+
+    out('5. Gemini не греют и не сжимают заранее');
+    timerSpeed = SPEED;       // дальше время идёт быстро: смотрим, как гаснет процесс Gemini
+    const b2 = fakeLog().length, kills = count('простой');
+    const g2 = await task('второй вопрос');
+    check('второй вопрос идёт в тот же живой процесс, без повторной загрузки беседы', startsFrom(b2).length === 0 && g2.shown.some((x) => x.includes('Gemini says: второй вопрос')), { starts: startsFrom(b2).length, shown: g2.shown });
+    check('в статусе второй задачи — беседа в памяти', calls.slice(cG).some((c) => c.method === 'sendMessage' && (c.payload.text || '').includes('🧵 беседа в памяти • Gemini 3.1 Pro')), calls.slice(cG).map((c) => c.payload.text));
+    await waitFor('процесс Gemini погас сам', () => count('простой') > kills, 20000);
+    timerSpeed = 200;
+    check('простой: процесс погас через ~70 минут, ни одного пинга и ни одного сжатия за это время', pingsSince(b2) === 0 && !asks(b2).some((x) => x.msg === '/compact'), asks(b2).map((x) => x.msg));
+    check('кэш Claude Gemini не касается: пингов в учёте нет', st().usage.warm.pings === 0, st().usage.warm);
+
+    out('6. Большая беседа и суточный потолок');
+    const b3 = fakeLog().length;
+    const g3 = await task('ДОРОГО: разбери всё');
+    check('после простоя процесс поднялся снова и продолжил ту же беседу', startsFrom(b3).length === 1 && flagOf(startsFrom(b3)[0].start, '--resume') === sid && g3.shown.some((x) => x.includes('💵 $0.38')), { starts: startsFrom(b3).map((s) => s.start), shown: g3.shown });
+    await sleepReal(60);
+    check('контекст 190к — бот сам беседу не сжимает (это дело Claude Code на окне 200к)', st().lastCtx === 190000 && !asks(b3).some((x) => x.msg === '/compact') && !texts().some((t) => t.includes('Сжимаю беседу') || t.includes('Беседа выросла')), { ctx: st().lastCtx });
+    const stBig = await statusText();
+    check('статус: 🔴 95% окна и пояснение, что сожмёт Claude Code', stBig.includes('🔴 Контекст: <b>190к</b> из 200к (95%)') && stBig.includes('Скоро Claude Code сожмёт беседу сам'), stBig);
+    check('потрачено больше потолка — статус показывает расход выше потолка', stBig.includes('из потолка $0.30') && /сегодня <b>\$0\.4\d<\/b>/.test(stBig), stBig);
+    const nBlocked = gemFake.reqs.length;
+    const g4 = await task('ещё вопрос');
+    check('потолок достигнут: мост не пускает к Google, владелец видит причину и что делать',
+      gemFake.reqs.length === nBlocked && g4.shown.some((x) => x.startsWith('❌') && x.includes('Суточный потолок расхода на Gemini достигнут') && x.includes('GEMINI_DAILY_USD') && x.includes('/model') && !x.includes('лимит подписки')), g4.shown);
+    check('отказ не стоил денег: в учёте сумма двух задач и проб, четвёртой нет', Math.abs(spendFile().usd - (sp1.usd + 0.0212 + 0.3812)) < 1e-9 && spendFile().calls === sp1.calls + 2, spendFile());
+
+    out('7. Возврат на Claude');
+    button('m:opus');
+    await waitFor('Claude выбран', () => texts().some((t) => t.includes('Модель: <b>Opus 5.5</b>')));
+    const back = lastWith('Модель: <b>Opus 5.5</b>').payload.text;
+    check('ответ на возврат: беседа общая, Claude видит всё, что сделал Gemini, кэш у него свой',
+      back.includes('Claude видит всё, что сделал Gemini 3.1 Pro') && back.includes('запишет беседу в него заново'), back);
+    const b5 = fakeLog().length;
+    const t5 = await task('вернулись на Claude');
+    const c5 = startsFrom(b5)[0] || { start: [], auth: {} };
+    check('Claude снова получает перевод, ответ по-русски', t5.got === EN('вернулись на Claude') && t5.shown.some((x) => x.includes(RUC(`Answer to: ${EN('вернулись на Claude')}`)) && !x.includes('🔷')), t5);
+    check('та же беседа: --resume с прежним номером, модель Opus без [1m]', flagOf(c5.start, '--resume') === sid && flagOf(c5.start, '--model') === 'opus', c5.start);
+    check('вход Claude вернулся полностью: подписка, ключ, провайдер; от моста ничего не осталось',
+      c5.auth.oauth && c5.auth.apiKey && c5.auth.base === 'https://proxy.invalid' && c5.auth.use.join() === 'CLAUDE_CODE_USE_BEDROCK' &&
+      c5.auth.toolSearch === undefined && c5.auth.window === undefined && c5.auth.nonEss === undefined, c5.auth);
+    check('WebSearch у Claude снова разрешён', !flagOf(c5.start, '--disallowed-tools').split(',').includes('WebSearch'));
+    const stC = await statusText();
+    check('статус как у Claude: прогрев и перевод, блока Gemini нет', stC.includes('Прогрев:') && stC.includes('Перевод: <b>включён</b>') && !stC.includes('Gemini через Vertex'), stC);
+    const limC = await limitsText();
+    check('в /limits блок Gemini остаётся: расход виден и при Claude', limC.includes('🔷 <b>Gemini (Vertex AI)</b>') && limC.includes('Gemini 3.1 Pro'), limC);
+    check('в журнале нет секретов: ни ключа, ни токенов', !logs.some((l) => /PRIVATE KEY|tok-\d+|Bearer /.test(l)), logs.filter((l) => /PRIVATE KEY|tok-\d+|Bearer /.test(l)).slice(0, 3));
+
+    // Claude Code для незнакомой модели шлёт усилие всегда (по умолчанию high), и мост переводит его в уровень размышлений Google
+    out('8. Усилие у Gemini');
+    const cnt = (s) => texts().filter((t) => t.includes(s)).length;
+    let n8 = cnt('Модель: <b>Gemini 3.1 Flash-Lite</b>');
+    button(`m:${LITE}`);
+    await waitFor('Flash-Lite выбран', () => cnt('Модель: <b>Gemini 3.1 Flash-Lite</b>') > n8);
+    n8 = cnt('Модель и режим');
+    text('/model');
+    await waitFor('экран модели у Gemini', () => cnt('Модель и режим') > n8);
+    const mg = lastWith('Модель и режим'), mgk = keysOf(mg);
+    check('меню у Gemini: сказано, какой уровень размышлений получит модель; «обычное» — это high',
+      mg.payload.text.includes('Усилие: <b>по умолчанию</b> — размышления Gemini: <b>high</b>') && mgk.some((b) => b.callback_data === 'e:' && b.text === '✅ обычное (high)'),
+      { text: mg.payload.text.slice(0, 220), keys: mgk.map((b) => b.text) });
+    check('кнопок усилия три — low, medium, high; xhigh и max (для Google тот же high) и 💸 убраны',
+      ['e:low', 'e:medium', 'e:high'].every((d) => mgk.some((b) => b.callback_data === d)) && !mgk.some((b) => /^e:(xhigh|max)$/.test(b.callback_data)) && !mgk.some((b) => b.text.includes('💸')), mgk.map((b) => b.text));
+    n8 = cnt('Размышления Gemini: <b>medium</b>');
+    button('e:medium');
+    await waitFor('усилие medium', () => cnt('Размышления Gemini: <b>medium</b>') > n8);
+    const e8 = lastWith('Размышления Gemini: <b>medium</b>').payload.text;
+    check('medium у Gemini: названо, что это экономнее, и как вернуть обычное; про лимит Claude ни слова',
+      e8.includes('Усилие: <b>medium</b>') && e8.includes('быстрее и дешевле') && e8.includes('«обычное»') && !e8.includes('лимит будет таять'), e8);
+    const b8 = fakeLog().length;
+    await task('вопрос на medium');
+    const s8 = startsFrom(b8)[0] || { start: [] };
+    check('процесс Gemini поднят с --effort medium: Claude Code передаст это мосту как уровень размышлений',
+      flagOf(s8.start, '--effort') === 'medium' && flagOf(s8.start, '--model') === `${LITE}[1m]` && flagOf(s8.start, '--resume') === sid, s8.start);
+    n8 = cnt('Усилие: <b>max</b>');
+    button('e:max');
+    await waitFor('усилие max', () => cnt('Усилие: <b>max</b>') > n8);
+    const x8 = lastWith('Усилие: <b>max</b>').payload.text;
+    check('max у Gemini — тот же high, и об этом сказано; предупреждения про дорогие размышления Claude нет',
+      x8.includes('Размышления Gemini: <b>high</b>') && x8.includes('одно и то же') && !x8.includes('долгих размышлений'), x8);
+    const stE = await statusText();
+    check('статус: усилие и уровень размышлений Gemini рядом, предупреждения про лимит нет',
+      stE.includes('усилие max • размышления high') && !stE.includes('лимит тает'), stE);
+    n8 = cnt('Усилие: <b>обычное</b>');
+    button('e:max');          // повторное нажатие снимает выбор
+    await waitFor('усилие снято', () => cnt('Усилие: <b>обычное</b>') > n8);
+    check('повторное нажатие вернуло обычное усилие', st().effort === '', st().effort);
+    n8 = cnt('Модель: <b>Opus 5.5</b>');
+    button('m:opus');
+    await waitFor('Claude выбран', () => cnt('Модель: <b>Opus 5.5</b>') > n8);
+    n8 = cnt('Усилие: <b>max</b>');
+    button('e:max');
+    await waitFor('усилие max у Claude', () => cnt('Усилие: <b>max</b>') > n8);
+    const c8 = lastWith('Усилие: <b>max</b>').payload.text;
+    check('у Claude max по-прежнему предупреждает про долгие размышления и лимит, про Gemini — ничего',
+      c8.includes('долгих размышлений') && c8.includes('лимит будет таять') && !c8.includes('Gemini'), c8);
+  } else if (BOOT === 'gemini-again') {
+    check('тот же релиз и Google уже объявляли — «Бот перезапущен»', first.includes('Бот перезапущен') && !sent().some((t) => t.includes('Бот обновлён')), sent());
+    await waitFor('проверка связи с Google при запуске', () => logs.some((l) => l.includes('Проверка связи с Google при запуске')), 10000);
+    await sleepReal(150);
+    check('связь проверена и в порядке', logs.some((l) => l.includes('Проверка связи с Google при запуске') && l.includes('"ok":true')) && gemFake.reqs.length === 1, logs.filter((l) => l.includes('Google')));
+    check('про Google второй раз не пишут', !sent().some((t) => t.includes('Модели Google')) && !sent().some((t) => t.includes('Gemini не отвечает')), sent());
+    text('/model');
+    await waitFor('экран модели', () => texts().some((t) => t.includes('Модель и режим')));
+    check('модели Google в меню на месте', keysOf(lastWith('Модель и режим')).some((b) => b.callback_data === 'm:gemini-3.1-pro-preview'));
+  } else if (BOOT === 'gemini-nokey') {
+    const warn = sent().find((t) => t.includes('Была выбрана модель'));
+    check('ключа на месте нет: предупреждение в журнале, бот при этом поднялся', logs.some((l) => l.includes('Модели Google не подключены')) && waiting !== null, logs.filter((l) => l.includes('Google')));
+    check('выбранную прежде модель Google бот заменил на Opus и сказал об этом', st().model === 'opus' && warn && warn.includes('gemini-3.1-pro-preview') && warn.includes('Вернул <b>Opus</b>'), { model: st().model, warn });
+    check('к Google при этом никто не ходил', gemFake.reqs.length === 0 && gemFake.tokens === 0, gemFake);
+    check('про «Модели Google подключены» ни слова', !sent().some((t) => t.includes('Модели Google подключены')), sent());
+    text('/model');
+    await waitFor('экран модели', () => texts().some((t) => t.includes('Модель и режим')));
+    const mp = lastWith('Модель и режим');
+    check('в меню нет ни Gemini, ни проверки связи, ни слова про Vertex', !keysOf(mp).some((b) => /gemini|gemtest/.test(b.callback_data)) && !mp.payload.text.includes('Vertex') && keysOf(mp).some((b) => b.callback_data === 'm:opus' && b.text.startsWith('✅')), keysOf(mp).map((b) => b.callback_data));
+    const noGoogle = () => texts().filter((t) => t.includes('Моделей Google нет')).length;
+    button('m:gemini-3.1-pro-preview');     // кнопка из давнего сообщения
+    await waitFor('отказ', () => noGoogle() === 1);
+    check('старая кнопка Gemini: объяснение про ключ, модель не сменилась', lastWith('Моделей Google нет').payload.text.includes('GEMINI_KEY_FILE') && st().model === 'opus', st().model);
+    button('act:gemtest');
+    await waitFor('отказ проверки', () => noGoogle() === 2);
+    const t1 = await task('привет, помоги');
+    check('Claude работает как обычно: перевод, русский ответ', t1.got === EN('привет, помоги') && t1.shown.some((x) => x.includes(RUC(`Answer to: ${EN('привет, помоги')}`))), t1);
+    check('вход Claude прежний, WebSearch разрешён', lastStart().auth.oauth && lastStart().auth.base === 'https://proxy.invalid' && !flagOf(lastStart().start, '--disallowed-tools').split(',').includes('WebSearch'), lastStart().auth);
+    text('/status');
+    await waitFor('статус', () => texts().some((t) => t.includes('Состояние')));
+    check('в статусе нет блока Gemini', !lastWith('Состояние').payload.text.includes('Gemini'), lastWith('Состояние').payload.text);
+    text('/limits');
+    await waitFor('лимиты', () => texts().some((t) => t.includes('Использование')));
+    check('в /limits нет блока Gemini', !lastWith('Использование').payload.text.includes('Gemini'), lastWith('Использование').payload.text);
+  } else if (BOOT === 'gemini-down') {
+    // Ключ верный, но Vertex отвечает 403 (не включён API или нет роли): самая вероятная поломка при первом подключении
+    await waitFor('жалоба на связь', () => sent().some((t) => t.includes('Gemini не отвечает')), 10000);
+    const w = sent().find((t) => t.includes('Gemini не отвечает'));
+    check('бот написал причину дословно и что проверить', w.includes('Vertex AI API has not been used') && w.includes('<code>test-proj</code>') && w.includes('Vertex AI User') && w.includes('Claude это не мешает'), w);
+    check('«Модели Google подключены» не писали, пока связи нет', !sent().some((t) => t.includes('Модели Google подключены')) && st().gemAnnounced !== true, sent());
+    check('в журнале предупреждение, а не ошибка бота', logs.some((l) => l.includes('WARN') && l.includes('Проверка связи с Google при запуске')), logs.filter((l) => l.includes('Google')));
+    const t1 = await task('привет, помоги');
+    check('Claude работает как обычно', t1.got === EN('привет, помоги'), t1);
+    text('/model');
+    await waitFor('экран модели', () => texts().some((t) => t.includes('Модель и режим')));
+    check('модели Google в меню остались: можно починить и проверить, не перезапуская бота', keysOf(lastWith('Модель и режим')).some((b) => b.callback_data === 'act:gemtest') && keysOf(lastWith('Модель и режим')).some((b) => b.callback_data === 'm:gemini-3.1-pro-preview'));
+    button('act:gemtest');
+    await waitFor('отчёт', () => texts().some((t) => t.includes('Проверка связи с Google')), 10000);
+    const rep = lastWith('Проверка связи с Google').payload.text;
+    check('кнопка проверки: ❌ у обеих моделей, причина и подсказка про роль', (rep.match(/❌/g) || []).length === 2 && rep.includes('Vertex AI API has not been used') && rep.includes('Vertex AI User'), rep);
+    gemFake.mode = 'ok';       // владелец включил API
+    const nTexts = texts().filter((t) => t.includes('Проверка связи с Google')).length;
+    button('act:gemtest');
+    await waitFor('второй отчёт', () => texts().filter((t) => t.includes('Проверка связи с Google')).length > nTexts, 10000);
+    const rep2 = lastWith('Проверка связи с Google').payload.text;
+    check('после починки та же кнопка показывает ✅ — без перезапуска бота', rep2.includes('✅ Gemini 3.1 Pro') && rep2.includes('✅ Gemini 3.1 Flash-Lite') && !rep2.includes('❌'), rep2);
+    button('m:gemini-3.1-pro-preview');
+    await waitFor('модель выбрана', () => texts().some((t) => t.includes('Модель: <b>Gemini 3.1 Pro</b>')));
+    const g1 = await task('что нового?');
+    check('Gemini отвечает после починки', g1.shown.some((x) => x.includes('Gemini says: что нового?') && x.includes('🔷 Gemini 3.1 Pro')), g1.shown);
+    gemFake.mode = 'deny';       // и снова сломалось посреди работы
+    const g2 = await task('ещё вопрос');
+    check('отказ Vertex посреди задачи: ❌ с текстом Google, бот жив и не называет это лимитом подписки',
+      g2.shown.some((x) => x.startsWith('❌') && x.includes('Vertex AI API has not been used') && !x.includes('лимит подписки')), g2.shown);
+    gemFake.mode = 'ok';
+    const g3 = await task('и снова работает');
+    check('как только Google ожил, следующая задача проходит', g3.shown.some((x) => x.includes('Gemini says: и снова работает')), g3.shown);
   }
   out(`\nИтог (${BOOT}): ${ok} ✓, ${bad} ✗`);
   process.exit(bad ? 1 : 0);
@@ -718,6 +1059,10 @@ let c14r = 0;
   const btns = mm.reply_markup.inline_keyboard.flat().map((x) => x.text);
   check('меню моделей с номерами', btns.includes('✅ Opus 5.5 — для сложной и повседневной работы') &&
         btns.includes('Sonnet 5.5 — быстрее и легче') && btns.includes('Haiku 4.5 — самая быстрая'), btns);
+  // Ключа Google на сервере нет — как у всех, кто бота не трогал: ничего про Gemini не появляется
+  check('без ключа Google: в меню нет Gemini и проверки связи, под меню ни слова про Vertex',
+        !btns.some((x) => /Gemini/.test(x)) && !mm.reply_markup.inline_keyboard.flat().some((x) => /gemini|gemtest/.test(x.callback_data)) && !mm.text.includes('Vertex'), mm);
+  check('без ключа Google: в статусе нет Gemini и объявлений про Google не было', !sTxt.includes('Gemini') && !texts().some((t) => t.includes('Модели Google')), sTxt);
 
   out('11. /compact');
   text('/compact');
@@ -1611,6 +1956,25 @@ let c14r = 0;
   T = await task15('No conversation found with session ID: abc');
   check('те же слова в обычном ответе беседу не сбрасывают: тот же номер, один запрос, без объяснений',
     T.shown.startsWith('✅') && T.got.length === 1 && st().sessions[cwdG] === sid3 && notice(T.c) === 0, { shown: T.shown, got: T.got });
+
+  // ── режим плана: Claude только читает, план приходит из ExitPlanMode, под ним кнопка «Выполнить» ──
+  out('17. Режим плана');
+  button('mode:plan');
+  await waitFor('режим плана включён', () => st().mode === 'plan');
+  let bP = fakeLog().length, cP = calls.length;
+  T = await task15(`составь план PLANQ ${MIX}`);
+  const planStart = fakeLog().slice(bP).filter((x) => x.start).pop();
+  check('процесс запущен с --permission-mode plan, без bypassPermissions',
+    Boolean(planStart) && startArg(planStart.start, '--permission-mode') === 'plan' && !planStart.start.includes('bypassPermissions'), planStart && planStart.start);
+  const planMsg = calls.slice(cP).filter((x) => x.method === 'sendMessage' && (x.payload.text || '').includes("БОДЫ"));
+  check('владелец получил сам план, а не отписку «Plan presented»', planMsg.length === 1 && !/ПРЕСЕНТЕД/i.test(planMsg[0].payload.text), textsFrom(cP));
+  check('под планом кнопка «Выполнить план»', planMsg.length === 1 && JSON.stringify(planMsg[0].payload.reply_markup || {}).includes('act:planrun'), planMsg[0] && planMsg[0].payload.reply_markup);
+  bP = fakeLog().length; cP = calls.length;
+  button('act:planrun');
+  await waitFor('выполнение плана началось', () => st().mode === 'dev' && calls.slice(cP).some((x) => x.method === 'sendMessage' && /^(✅|💬|❌)/.test(x.payload.text || '')), 20000);
+  const runStart = fakeLog().slice(bP).filter((x) => x.start).pop();
+  check('после «Выполнить»: режим разработки, процесс с полным доступом', st().mode === 'dev' && Boolean(runStart) && runStart.start.includes('bypassPermissions') && !runStart.start.includes('plan'), runStart && runStart.start);
+  check('в обычном режиме кнопки «Выполнить план» под ответом нет', !calls.slice(cP).some((x) => x.method === 'sendMessage' && JSON.stringify(x.payload.reply_markup || {}).includes('act:planrun')));
 
   // ── остановка бота (systemctl restart): висящий переводчик не должен осиротеть ──
   timerSpeed = 1;             // таймауты настоящие: иначе зависший переводчик погиб бы сам раньше, чем бот получит сигнал

@@ -51,7 +51,7 @@ git clone -q -c core.autocrlf=false "$T/origin.git" "$T/work" 2>/dev/null
 cd "$T/work" || exit 1
 git config user.email t@example.com; git config user.name tester
 mkdir -p deploy
-cp "$SRC/bot.js" "$SRC/limits.sh" .
+cp "$SRC/bot.js" "$SRC/gemini.js" "$SRC/limits.sh" .
 cp "$SRC/deploy/claude-tg-bot-update" deploy/
 echo "# v1" > README.md
 git add -A; git commit -qm "v1"; git branch -M main; git push -q origin main 2>/dev/null
@@ -199,6 +199,29 @@ reset; mkdir -p "$T/plain"; REPO_UNDER_TEST="$T/plain" run
 check "выход с ошибкой" test "$rc" = 1
 check "сказал, что это не клон" said "не клон"
 check "владельцу установки написано" test -s "$T/notify"
+
+echo "12б. Правка одного gemini.js (мост к Google): бот перезапускается, сломанный мост не ставится"
+reset; push gemini.js "// v12" "правка gemini.js"; run
+check "выход без ошибки" test "$rc" = 0
+check "подтянуто" synced
+check "бот перезапущен один раз" test "$(nrestart)" = 1
+check "владельцу установки не пишет" test ! -s "$T/notify"
+reset; before=$(head_of "$T/inst")
+push gemini.js "this is ((( not javascript" "поломка моста"; run
+check "выход с ошибкой" test "$rc" = 1
+check "осталась прежняя версия" test "$(head_of "$T/inst")" = "$before"
+check "перезапуска нет" test "$(nrestart)" = 0
+check "в сообщении назван gemini.js" said "ошибка в gemini.js"
+check "владельцу установки написано" test -s "$T/notify"
+reset; ( cd "$T/work" && git revert --no-edit HEAD >/dev/null && git push -q origin main 2>/dev/null ); run
+check "откат поломки подтянут" synced
+check "содержимое прежнее: перезапуск не нужен" test "$(nrestart)" = 0
+reset; push gemini.js "// v12б" "ещё правка моста"; journal "Запуск задачи" 600; run
+check "пока идёт задача, правка моста откладывается" said "отложено"
+check "перезапусков не было" test "$(nrestart)" = 0
+reset; journal "Задача выполнена" 3600; run
+check "в тишине правка моста подтянута" synced
+check "бот перезапущен один раз" test "$(nrestart)" = 1
 
 echo "13. Журнальные строки, по которым скрипт судит о занятости, есть в bot.js"
 pat=$(sed -n "s/.*grep -E '\(Запуск задачи[^']*\)'.*/\1/p" "$SRC/deploy/claude-tg-bot-update")

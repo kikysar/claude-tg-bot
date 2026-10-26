@@ -23,6 +23,14 @@ const PROJECTS_ROOT = process.env.PROJECTS_ROOT || '/opt/projects';
 const STATE_FILE = process.env.STATE_FILE || '/var/lib/claude-tg-bot/state.json';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || '/usr/bin/claude';
 
+// Модели Google через Vertex AI. Это тот же Claude Code, у которого вместо Anthropic запросы идут на мост gemini.js
+// (127.0.0.1): агент, инструменты и файл беседы остаются теми же, поэтому Gemini видит всё, что сделал Claude, и наоборот.
+// Включается ключом сервисного аккаунта Google Cloud (файл JSON); без него в /model моделей Google нет.
+const GEMINI_KEY_FILE = String(process.env.GEMINI_KEY_FILE || process.env.GOOGLE_APPLICATION_CREDENTIALS || '').trim();
+// Окно сжатия у Gemini: запрос длиннее 200 тыс. токенов Vertex считает по двойному тарифу, поэтому держимся ниже
+const GEMINI_COMPACT_WINDOW = Number(process.env.GEMINI_COMPACT_WINDOW) || 200000;
+const isGem = (m) => /^gemini-/i.test(String(m || ''));
+
 // Голосовой ввод: локальный whisper.cpp + статический ffmpeg (без root и без
 // API-ключа). Всё лежит в каталоге состояния, права claudebot.
 const STT_DIR = process.env.STT_DIR || '/var/lib/claude-tg-bot/stt';
@@ -68,11 +76,17 @@ const NO_AGENT_ENV = {
   CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS: '1',
 };
 
-const BOT_VERSION = '2026-10-12.2';
+const BOT_VERSION = '2026-10-26.1';
+
+// Режим плана: тот же английский для экономии, что и у остальных подсказок
+const PLAN_EN = 'Plan mode: change nothing and run no command that modifies anything. Study the code and data, then give a ' +
+  'complete step-by-step plan: what to change and in which files, how to verify, what the risks are. This overrides any ' +
+  'request to be brief: the plan must be complete but without filler.';
 
 /** «Что нового» после обновления: про перевод — по тому, включён ли он на самом деле. */
 function whatsNew() {
-  const head = '♻️ <b>Бот обновлён</b>\n\n';
+  const head = '♻️ <b>Бот обновлён</b>\n\n📝 <b>Новый режим — план</b> (в /model): Claude читает код и данные, ничего не меняет и выдаёт план, ' +
+    'а кнопка «▶️ Выполнить план» под ним запускает работу. Ещё починил голосовые длиной около 28 секунд.\n\n';
   if (!translateOn()) {
     return `${head}🌐 В боте есть перевод: сообщения уходят к Claude по-английски, а ответы возвращаются по-русски, ` +
       `так лимит тает медленнее. Сейчас он выключен — включить и проверить: /translate.`;
@@ -128,6 +142,7 @@ let state = {
   trAnnounced: false,    // сообщили, что перевод заработал
   trAuto: null,          // перевод выключен самим ботом из-за системного сбоя: {at, kind, reason}
   trOkAt: 0,             // когда переводчик через Claude Code в последний раз отработал
+  gemAnnounced: false,   // сказали, что в /model появились модели Google
 };
 
 function loadState() {
@@ -494,8 +509,9 @@ function baseEq(u) {
 const ctxOf = (u) => (u ? (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0)
                           + (u.input_tokens || 0) : 0);
 
-function trackUsage(ev) {
-  const cost = Number(ev.total_cost_usd || 0);
+function trackUsage(ev, { gem = false } = {}) {
+  // Цену Gemini Claude Code считает по чужому прайсу, да и деньги это не подписки: настоящий расход ведёт мост (см. gemSpend)
+  const cost = gem ? 0 : Number(ev.total_cost_usd || 0);
   const u = ev.usage || {};
   state.lastUsage = u;
   const inTok = Number(u.input_tokens || 0) + Number(u.cache_read_input_tokens || 0);
@@ -566,8 +582,12 @@ function trBackend() {
   if (want === 'api') return trKey() ? 'api' : 'none';
   return trKey() ? 'api' : 'cli';
 }
-/** Переводить ли: включено в боте и есть чем. Сбои переводчика на это не влияют — иначе процесс Claude перезапускался бы. */
-const translateOn = () => state.translate !== false && trBackend() !== 'none';
+/**
+ * Переводить ли: включено в боте и есть чем. Сбои переводчика на это не влияют — иначе процесс Claude перезапускался бы.
+ * С Gemini не переводим: перевод бережёт лимит подписки Claude, а Gemini оплачивается деньгами и по-русски читает свободно;
+ * к тому же переводил бы Haiku, то есть тот самый лимит, который к моменту переключения мог кончиться.
+ */
+const translateOn = () => state.translate !== false && trBackend() !== 'none' && !isGem(state.model);
 const hasCyr = (s) => /[А-Яа-яЁё]/.test(s);
 const hasLat = (s) => /[A-Za-z]/.test(s);
 const cyrShare = (s) => {
@@ -1193,6 +1213,50 @@ function noteTaskCost(res, translated) {
   c.n++; c.base += baseEq(res.usage);
 }
 
+// ─────────────────────── Gemini через Vertex AI ───────────────────────
+
+let gem = null;      // модуль gemini.js
+let bridge = null;   // мост, пока он запущен
+
+/** Поднимает мост, если в окружении есть ключ. Не вышло — бот работает как раньше, только без моделей Google. */
+async function startGemini() {
+  if (!GEMINI_KEY_FILE) return;
+  const daily = process.env.GEMINI_DAILY_USD;
+  try {
+    gem = require('./gemini.js');
+    bridge = await gem.createBridge({
+      keyFile: GEMINI_KEY_FILE,
+      location: process.env.GEMINI_LOCATION || undefined,
+      models: process.env.GEMINI_MODELS || undefined,
+      dailyUsd: daily === undefined || daily === '' ? undefined : Number(daily),   // 0 — без потолка
+      level: process.env.GEMINI_LEVEL || undefined,
+      vertexBase: process.env.GEMINI_VERTEX_BASE || undefined,                     // два адреса ниже нужны только проверкам
+      tokenUrl: process.env.GEMINI_TOKEN_URL || undefined,
+      dataDir: path.join(path.dirname(STATE_FILE), 'gemini'),
+      log,
+    }).listen();
+    log('INFO', 'Мост Gemini запущен', { адрес: bridge.baseUrl, проект: bridge.project, регион: bridge.location, моделей: bridge.models.length });
+  } catch (e) {
+    bridge = null;
+    log('WARN', `Модели Google не подключены: ${e.message}`);
+  }
+}
+
+/** Сколько всего потрачено на Gemini, $. Разница до и после задачи — её цена: бот выполняет задачи строго по одной. */
+const gemTotal = () => (bridge ? bridge.spend.d.total.usd : 0);
+
+/** «$0.75 / $3.75» — цена миллиона токенов на входе и на выходе; ≈ у моделей, чей прайс оценён по соседним. */
+function gemPrice(id) {
+  const m = gem && gem.modelInfo(id);
+  return m ? `${m.estimated ? '≈' : ''}$${m.price.in} / $${m.price.out}` : '';
+}
+
+const gemUsd = (v) => `$${v < 0.1 ? v.toFixed(3) : v.toFixed(2)}`;
+
+/** Какой уровень размышлений получит Gemini. Для незнакомой модели Claude Code шлёт усилие всегда (без выбора — high),
+ *  а xhigh и max Google не знает: это тот же high. */
+const gemThinking = (effort) => (gem ? gem.thinkingLevel({ output_config: { effort: effort || 'high' } }, 'high') : 'high');
+
 // ─────────────────────── Claude Code: версия и модели ───────────────────────
 
 let cli = { version: '', latest: {}, mtime: 0 };
@@ -1206,6 +1270,7 @@ function modelName(id) {
 
 /** Что стоит за пунктом меню: «opus» → «Opus 5.5» по каталогу установленного CLI. */
 function modelLabel(alias) {
+  if (isGem(alias)) return gem ? gem.geminiLabel(alias) : alias;
   const id = cli.latest[alias] || (state.resolved || {})[alias];
   return (id && modelName(id)) || MODELS[alias]?.family || alias || 'по умолчанию';
 }
@@ -1417,10 +1482,13 @@ async function coolCompact(e) {
        { disable_notification: true }).catch(() => {});
 }
 
+const modeName = () => ({ talk: 'обсуждение', plan: 'план' }[state.mode] || 'разработка');
+
 function startEngine() {
   const cwd = state.activeProject;
   const sessionId = state.sessions[cwd];
   const talk = state.mode === 'talk';
+  const planMode = state.mode === 'plan';
   refreshCli().catch(() => {});   // заодно заметить, не обновился ли CLI
 
   const args = ['-p', '--input-format', 'stream-json',
@@ -1450,15 +1518,26 @@ function startEngine() {
   }
   // Выводы команд оседают в контексте навсегда и дорожают каждое следующее
   // сообщение: в прошлой беседе они дали 13,7 МБ из 21.
+  if (planMode) {
+    extra.push(tr ? PLAN_EN :
+      'Режим плана: ничего не меняй и не запускай команд, которые что-то меняют. Изучи код и данные, затем выдай готовый ' +
+      'пошаговый план: что и в каких файлах поменять, чем проверить, чем рискуем. Это исключение из просьбы отвечать кратко: ' +
+      'план должен быть полным, но без воды.');
+  }
   extra.push(tr ? RAW_EN :
     'Не вываливай в контекст сырые данные. Агрегируй прямо в команде: печатай ' +
     'итог, а не полный список; длинные выводы обрезай через head; при разборе ' +
     'таблиц и логов считай в python и выводи только результат.');
   args.push('--append-system-prompt', extra.join(' '));
+  // С Gemini тот же Claude Code ходит не в Anthropic, а на мост. WebSearch у Claude — серверный инструмент Anthropic: мост
+  // перехватывает его подзапрос web_search и отвечает через поиск Google (gemini.js, searchAnswer).
+  const viaGem = isGem(state.model) && Boolean(bridge);
   if (talk) args.push('--tools', '');   // обсуждение и расчёты — без инструментов
+  else if (planMode) args.push('--permission-mode', 'plan', '--disallowed-tools', NO_AGENT_TOOLS.join(','));   // читает, но не правит
   else args.push('--permission-mode', 'bypassPermissions',
                  '--disallowed-tools', NO_AGENT_TOOLS.join(','));
-  if (state.model) args.push('--model', state.model);
+  // [1m] — окно в миллион токенов: Claude Code не знает моделей Google и без суффикса считал бы окно в 200 тысяч
+  if (state.model) args.push('--model', viaGem ? `${state.model}[1m]` : state.model);
   if (state.effort) args.push('--effort', state.effort);
   if (sessionId) args.push('--resume', sessionId);
   else args.push('--session-id', crypto.randomUUID());
@@ -1466,16 +1545,30 @@ function startEngine() {
   // Ключ переводчика Claude ни к чему: всё, что он выведет из окружения, уходит в беседу
   const childEnv = { ...process.env, CI: '1', TERM: 'dumb', ...NO_AGENT_ENV };
   for (const v of TR_KEY_VARS) delete childEnv[v];
+  if (viaGem) {
+    // До моста не должны дойти ни вход по подписке, ни ключ API, ни другой провайдер: он принимает только свой секрет
+    for (const k of Object.keys(childEnv)) {
+      if (k.startsWith('ANTHROPIC_') || k.startsWith('CLAUDE_CODE_OAUTH_') || k.startsWith('CLAUDE_CODE_USE_')) delete childEnv[k];
+    }
+    Object.assign(childEnv, {
+      ANTHROPIC_BASE_URL: bridge.baseUrl, ANTHROPIC_AUTH_TOKEN: bridge.secret,
+      ENABLE_TOOL_SEARCH: 'false',                        // отложенные инструменты (ToolSearch) мост не понимает
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',      // обновления и телеметрия Anthropic тут ни к чему
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(GEMINI_COMPACT_WINDOW),
+    });
+  }
   const child = spawn(CLAUDE_BIN, args, { cwd, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] });
 
   const now = Date.now();
+  // Кэш Gemini живёт у Google считанные минуты и греть его пингами дороже, чем перезаписать, поэтому процесс не греется
   const e = { child, key: engineKey(), alias: state.model, cwd, buf: '', stderr: '',
               waiter: null, onEvent: null, idleTimer: null, fresh: !sessionId,
               model: '', lastCall: null, turnIsPing: false, binMtime: cli.mtime,
               lastTurnAt: now,     // когда кэш грелся в последний раз
               lastUserAt: now,     // когда закончился последний настоящий ход
-              noWarm: false, stale: false,
-              coolDone: false,     // в эту паузу беседу уже сжимали
+              gem: viaGem,         // процесс работает через мост Gemini
+              noWarm: viaGem, stale: false,
+              coolDone: viaGem,    // в эту паузу беседу уже сжимали
               compacting: false, compactedAt: 0 };
   engine = e;
   log('INFO', 'Поднят процесс Claude', { cwd, продолжение: Boolean(sessionId), cli: cli.version });
@@ -1517,8 +1610,8 @@ function startEngine() {
 
       if (ev.type === 'result') {
         e.lastTurnAt = Date.now();
-        // Событие о лимитах идёт только при смене процента: тихий ответ значит «без перемен»
-        if (state.rate) state.rate.seenAt = e.lastTurnAt;
+        // Событие о лимитах идёт только при смене процента: тихий ответ значит «без перемен»; у Gemini лимитов подписки нет
+        if (state.rate && !e.gem) state.rate.seenAt = e.lastTurnAt;
         if (!e.turnIsPing) { e.lastUserAt = e.lastTurnAt; e.coolDone = false; }
         state.lastCtx = ctxOf(e.lastCall); saveState();
         if (e.waiter) { const w = e.waiter; e.waiter = null; e.onEvent = null; w.resolve(ev); }
@@ -1609,6 +1702,8 @@ async function runClaude(task) {
   const alive = Boolean(engine && engine.key === engineKey());
   const warm = alive && Date.now() - engine.lastTurnAt < CACHE_TTL_MS;
   const blocks = task.blocks || [];
+  const viaGem = isGem(state.model) && Boolean(bridge);   // отвечает Gemini, а не Claude
+  const gemBefore = gemTotal();
 
   log('INFO', 'Запуск задачи', {
     cwd, режим: state.mode, модель: state.model,
@@ -1622,6 +1717,7 @@ async function runClaude(task) {
   let statusId = null, toolCount = 0, lastTool = '', lastEdit = 0;
 
   const cache = !state.sessions[cwd] ? '🆕 новая беседа'
+    : viaGem ? (alive ? '🧵 беседа в памяти' : '🧵 загружаю историю')
     : alive && engine.compacting ? '🗜 как раз сжимаю беседу после паузы — отвечу через минуту-две'
     : warm ? '🔥 кэш тёплый'
     : alive ? '🧊 кэш остыл — этот ответ дороже'
@@ -1668,9 +1764,11 @@ async function runClaude(task) {
   // чтение файла, а каждый ход перечитывает весь контекст.
   const content = [{ type: 'text', text: promptText }, ...blocks];
 
+  let planText = '';
   const onEvent = (ev) => {
     if (ev.type === 'assistant' && ev.message?.content) {
       for (const b of ev.message.content) {
+        if (b.type === 'tool_use' && b.name === 'ExitPlanMode' && typeof b.input?.plan === 'string') planText = b.input.plan;
         if (b.type === 'tool_use') { toolCount++; lastTool = describeTool(b); progress(); }
       }
     }
@@ -1692,7 +1790,9 @@ async function runClaude(task) {
 
   // Ответ — на русский, пока на экране статус: пауза не должна выглядеть зависанием.
   // Задача считается идущей до конца перевода, новые сообщения тем временем встают в очередь.
-  const raw = res.result || '';
+  let raw = res.result || '';
+  // В режиме плана итоговый текст бывает короткой отпиской, а сам план лежит в вызове ExitPlanMode
+  if (state.mode === 'plan' && planText.trim() && !raw.includes(planText.trim().slice(0, 80))) raw = planText;
   const failedRun = Boolean(res.is_error) || res.subtype !== 'success';
   let shown = raw, outRes = null;
   if (trActive && !res.__dead && !me?.cancelled && !failedRun && raw.trim()) {
@@ -1727,16 +1827,18 @@ async function runClaude(task) {
                 `<i>Напишите ещё раз — беседа продолжится с сохранённого места.</i>`);
   }
 
-  trackUsage(res);
-  noteTaskCost(res, trActive);
+  trackUsage(res, { gem: viaGem });
+  if (!viaGem) noteTaskCost(res, trActive);
+  const spent = viaGem ? Math.max(0, gemTotal() - gemBefore) : 0;
 
   if (failedRun) {
     log('ERROR', 'Задача с ошибкой', { subtype: res.subtype });
     const detail = (raw || errorsOf(res) || stderrTail || 'нет подробностей').trim();
     const limitHit = /rate.?limit|usage limit|too many requests|429/i.test(detail);
     return send(
-      `❌ <b>Ошибка</b> • ${fmtDur(secs)}\n\n<pre>${esc(detail.slice(0, 2500))}</pre>` +
-      (limitHit ? `\n\n⚠️ Похоже, достигнут лимит подписки — загляните в 📈 Лимиты.` : '')
+      `❌ <b>Ошибка</b> • ${fmtDur(secs)}${spent > 0 ? ` • 💵 ${gemUsd(spent)}` : ''}\n\n<pre>${esc(detail.slice(0, 2500))}</pre>` +
+      (limitHit ? (viaGem ? `\n\n⚠️ Похоже, Google ограничил частоту запросов — подождите минуту или вернитесь на Claude: /model`
+                          : `\n\n⚠️ Похоже, достигнут лимит подписки — загляните в 📈 Лимиты.`) : '')
     );
   }
 
@@ -1751,10 +1853,11 @@ async function runClaude(task) {
   if (trActive && inFailed) lost.push('запрос ушёл без перевода');
   if (trActive && raw.trim() && (!outRes || outRes.failed)) lost.push('ответ остался на английском');
   const meta = `${talk ? '💬' : '✅'} ${fmtDur(secs)}${toolCount ? ` • 🔧 ${toolCount}` : ''} • 📁 ${esc(pName())}` +
+    (viaGem ? ` • 🔷 ${esc(modelLabel(state.model))}${spent > 0 ? ` • 💵 ${gemUsd(spent)}` : ''}` : '') +
     (trActive ? (lost.length ? ' • 🌐⚠️' : ' • 🌐') : '') +
     (lost.length ? `\n⚠️ <i>Перевод не сработал: ${lost.join(', ')}. Подробности — /translate</i>` : '');
 
-  await deliver(shown, meta, taskKeyboard({ original: translatedOut }));
+  await deliver(shown, meta, taskKeyboard({ original: translatedOut, plan: state.mode === 'plan' && shown.trim() !== '' }));
   // Сжимаем после ответа, а не до: задача уже закрыта, ждать никого не заставляем
   return autoCompact();
 }
@@ -1830,17 +1933,18 @@ function plural(n, one, few, many) {
  * Кнопки под ответом. На тяжёлой беседе добавляем сжатие: именно её объём
  * оплачивается заново при каждом холодном старте.
  */
-function taskKeyboard({ original = false } = {}) {
+function taskKeyboard({ original = false, plan = false } = {}) {
   const rows = [[
     { text: '🆕 Новая беседа', callback_data: 'act:newask' },
     { text: '📊 Статус', callback_data: 'act:status' },
   ]];
   // Ответ пришёл через переводчика — оригинал под рукой, если перевод кажется кривым
   if (original) rows.push([{ text: '🇬🇧 Оригинал ответа', callback_data: 'act:orig' }]);
+  if (plan) rows.unshift([{ text: '▶️ Выполнить план', callback_data: 'act:planrun' }]);
   // На разросшейся беседе предлагаем начать новую, а не сжимать: сжатие
   // перечитывает весь диалог и стоит примерно как он сам, а новая беседа
   // стартует почти с нуля. Память проекта при этом никуда не девается.
-  if (lastContext() >= CTX_LIMIT) {
+  if (lastContext() >= CTX_LIMIT && !isGem(state.model)) {
     rows.unshift([{ text: '🆕 Начать новую — дешевле', callback_data: 'act:newask' }]);
   }
   return { inline_keyboard: rows };
@@ -1923,29 +2027,65 @@ async function screenModel() {
     text: `${state.model === k ? '✅ ' : ''}${modelLabel(k)} — ${m.hint}`,
     callback_data: `m:${k}`,
   }]);
+  if (bridge) {
+    for (const m of bridge.models) {
+      rows.push([{ text: `${state.model === m.id ? '✅ ' : '🔷 '}${m.label}${m.hint ? ` — ${m.hint}` : ''}`, callback_data: `m:${m.id}` }]);
+    }
+  }
   // Усилие — это объём размышлений, а они идут в выхлоп, который стоит ×5.
   // high и выше выжигают лимит быстрее всего, поэтому подписываем цену.
-  rows.push([{ text: `${!state.effort ? '✅ ' : ''}обычное (дёшево)`, callback_data: 'e:' }]);
-  rows.push(EFFORTS.map((e) => ({
-    text: `${state.effort === e ? '✅' : ''}${e}${e === 'high' || e === 'xhigh' || e === 'max' ? '💸' : ''}`,
+  // У Gemini «обычное» уже high, а xhigh и max от него не отличаются, так что кнопок три и без цены.
+  const onGem = isGem(state.model) && Boolean(bridge);
+  rows.push([{ text: `${!state.effort ? '✅ ' : ''}${onGem ? 'обычное (high)' : 'обычное (дёшево)'}`, callback_data: 'e:' }]);
+  rows.push((onGem ? EFFORTS.slice(0, 3) : EFFORTS).map((e) => ({
+    text: `${state.effort === e ? '✅' : ''}${e}${!onGem && (e === 'high' || e === 'xhigh' || e === 'max') ? '💸' : ''}`,
     callback_data: `e:${e}`,
   })));
   rows.push([
     { text: `${state.mode === 'dev' ? '✅ ' : ''}🛠 Разработка`, callback_data: 'mode:dev' },
+    { text: `${state.mode === 'plan' ? '✅ ' : ''}📝 План`, callback_data: 'mode:plan' },
     { text: `${state.mode === 'talk' ? '✅ ' : ''}💬 Обсуждение`, callback_data: 'mode:talk' },
   ]);
+  if (bridge) rows.push([{ text: '🧪 Проверить связь с Google', callback_data: 'act:gemtest' }]);
 
   return send(
     `🤖 <b>Модель и режим</b>\n\n` +
     `Сейчас: <b>${esc(modelLabel(state.model))}</b>\n` +
-    `Усилие: <b>${esc(state.effort || 'по умолчанию')}</b>\n` +
-    `Режим: <b>${state.mode === 'talk' ? 'обсуждение' : 'разработка'}</b>\n\n` +
+    `Усилие: <b>${esc(state.effort || 'по умолчанию')}</b>` +
+    `${onGem ? ` — размышления Gemini: <b>${gemThinking(state.effort)}</b>` : ''}\n` +
+    `Режим: <b>${modeName()}</b>\n\n` +
     `<i>Обсуждение — без доступа к файлам и командам: быстрее и дешевле, ` +
-    `подходит для вопросов и расчётов. Разработка — полный доступ.</i>\n\n` +
+    `подходит для вопросов и расчётов. План — читает код и данные, ничего не меняет и выдаёт план, который потом ` +
+    `выполняется кнопкой. Разработка — полный доступ.</i>\n\n` +
     `<i>Каждое семейство — всегда самая новая модель: Claude Code` +
-    `${cli.version ? ` ${esc(cli.version)}` : ''} обновляется сам каждую ночь.</i>`,
+    `${cli.version ? ` ${esc(cli.version)}` : ''} обновляется сам каждую ночь.</i>` +
+    (bridge
+      ? `\n\n🔷 <b>Gemini</b> — модели Google через Vertex AI. Беседа общая с Claude: переключились, и Gemini видит всю историю ` +
+        `и правит файлы теми же инструментами; вернулись на Claude — он видит, что сделал Gemini. Это не подписка Claude, а ` +
+        `деньги Google Cloud: сегодня потрачено <b>${gemUsd(bridge.spend.today())}</b>` +
+        `${bridge.dailyUsd > 0 ? ` из потолка ${gemUsd(bridge.dailyUsd)}` : ''}.\n` +
+        `<i>Цена миллиона токенов, вход / выход: ${bridge.models.map((m) => `${esc(m.label)} ${gemPrice(m.id)}`).join(' • ')}</i>`
+      : ''),
     { reply_markup: { inline_keyboard: rows } }
   );
+}
+
+/** Короткий настоящий запрос к модели Google: доходит ли ключ, включён ли Vertex AI, отвечает ли модель. Стоит доли цента. */
+async function cmdGemTest() {
+  if (!bridge) return send('❌ Моделей Google нет: в настройках сервера не задан ключ <code>GEMINI_KEY_FILE</code>.');
+  const wait = await send('🧪 Проверяю связь с Google…');
+  const ids = [isGem(state.model) ? state.model : bridge.defaultModel];
+  if (!ids.includes(gem.SMALL_MODEL)) ids.push(gem.SMALL_MODEL);   // на ней Claude Code делает служебные обращения
+  const rs = await Promise.all(ids.map((id) => bridge.probe(id)));
+  const lines = rs.map((r) => (r.ok
+    ? `✅ ${esc(gem.geminiLabel(r.model))} — ответила за ${(r.ms / 1000).toFixed(1)} с`
+    : `❌ ${esc(gem.geminiLabel(r.model))}\n<code>${esc(r.error)}</code>`));
+  const bad = rs.find((r) => !r.ok);
+  const report = `🧪 <b>Проверка связи с Google</b>\n\n${lines.join('\n')}\n\n` +
+    `<i>Проект ${esc(bridge.project)}, регион ${esc(bridge.location)}.` +
+    `${bad ? ' Частые причины: не включён Vertex AI API в проекте, у сервисного аккаунта нет роли «Vertex AI User», нет доступа к модели.' : ''}</i>`;
+  log(bad ? 'WARN' : 'INFO', 'Проверка связи с Google', { результаты: rs.map((r) => ({ модель: r.model, ok: r.ok, мс: r.ms })) });
+  if (wait) await edit(wait.message_id, report); else await send(report);
 }
 
 /** Сколько задач прошло через бота — в штуках, без денег: работа по подписке. */
@@ -2198,6 +2338,16 @@ async function screenUsage(force = false) {
            'а когда он ответит, нажмите «Обновить».', '');
   }
 
+  if (bridge) {
+    const sp = bridge.spend.d;
+    L.push('🔷 <b>Gemini (Vertex AI)</b>',
+      `Сегодня: <b>${gemUsd(bridge.spend.today())}</b>${bridge.dailyUsd > 0 ? ` из потолка ${gemUsd(bridge.dailyUsd)}` : ' (потолка нет)'} • ${sp.calls} обращений`,
+      `Всего: ${gemUsd(sp.total.usd)} • ${sp.total.calls} обращений`,
+      ...Object.entries(sp.byModel).sort((a, b) => b[1].usd - a[1].usd).slice(0, 4)
+        .map(([id, v]) => `  ${esc(gem.geminiLabel(id))} — ${gemUsd(v.usd)}`),
+      '<i>Это деньги Google Cloud, а не лимит подписки Claude.</i>', '');
+  }
+
   L.push('📋 <b>Задач через бота</b>', tasksSummary());
 
   const ago = (sec) => (sec < 60 ? `${sec} с` : sec < 3600 ? `${Math.round(sec / 60)} мин`
@@ -2223,6 +2373,7 @@ async function screenUsage(force = false) {
 }
 
 async function screenStatus() {
+  const viaGem = isGem(state.model) && Boolean(bridge);
   const L = ['📊 <b>Состояние</b>', ''];
   L.push(`📁 Проект: <b>${esc(pName())}</b>`);
   if (state.activeProject) {
@@ -2232,40 +2383,56 @@ async function screenStatus() {
   }
   L.push(`🤖 Модель: <b>${esc(modelLabel(state.model))}</b>` +
          `${state.effort ? ` • усилие ${esc(state.effort)}` : ''}` +
+         `${viaGem ? ` • размышления ${gemThinking(state.effort)}` : ''}` +
          `${cli.version ? ` • Claude Code ${esc(cli.version)}` : ''}`);
-  L.push(`⚙️ Режим: <b>${state.mode === 'talk' ? '💬 обсуждение' : '🛠 разработка'}</b>`);
+  L.push(`⚙️ Режим: <b>${{ talk: '💬 обсуждение', plan: '📝 план' }[state.mode] || '🛠 разработка'}</b>`);
   {
     const be = trBackend();
     const off = String(process.env.TRANSLATE_BACKEND || '').trim().toLowerCase() === 'off';
-    L.push(be === 'none' ? `🌐 Перевод: <b>${off ? 'отключён на сервере' : 'нет ключа DeepSeek'}</b>`
+    L.push(viaGem ? '🌐 Перевод: <b>не нужен</b> — с Gemini сообщения идут по-русски, как написаны'
+      : be === 'none' ? `🌐 Перевод: <b>${off ? 'отключён на сервере' : 'нет ключа DeepSeek'}</b>`
       : `🌐 Перевод: <b>${translateOn() ? 'включён' : 'выключен'}</b> • ${be === 'cli' ? 'Haiku по подписке' : 'DeepSeek'}`);
   }
   const alive = engine && engine.key === engineKey();
-  const left = alive ? warmEnd(engine) - Date.now() : 0;
-  if (alive && engine.waiter) L.push('🔥 Кэш тёплый — Claude сейчас работает');
-  else if (left > 0) {
-    L.push(`🔥 Кэш тёплый ещё <b>${fmtDur(Math.round(left / 1000))}</b> — ответы быстрые и дешёвые`);
-  } else if (alive) L.push('🧊 Кэш остыл — первый ответ дороже');
-  else L.push('💤 Процесс спит — первый ответ дольше и дороже');
-  L.push(`♨️ Прогрев: <b>${state.warmHours ? `${state.warmHours} ч после сообщения` : 'выключен'}</b>` +
-         `${state.coolCompact ? ` • после — сжатие бесед от ${kTok(COOL_COMPACT_MIN)}` : ''}` +
-         `${alive && engine.noWarm ? ' • для этой беседы не удержал кэш' : ''}` +
-         `${alive && engine.stale ? ' • ждёт паузы, чтобы перейти на новый Claude Code' : ''}`);
+  if (viaGem) {
+    const sp = bridge.spend.d;
+    L.push(`🔷 Gemini через Vertex AI • проект <code>${esc(bridge.project)}</code>`);
+    L.push(`💵 Расход: сегодня <b>${gemUsd(bridge.spend.today())}</b>${bridge.dailyUsd > 0 ? ` из потолка ${gemUsd(bridge.dailyUsd)}` : ''}` +
+           ` • всего ${gemUsd(sp.total.usd)} за ${sp.total.calls} обращений`);
+    L.push(alive ? (engine.waiter ? '⚙️ Gemini сейчас работает' : '🧵 Беседа в памяти процесса — ответы быстрые')
+                 : '💤 Процесс спит — первый ответ дольше: беседа загрузится из файла');
+  } else {
+    const left = alive ? warmEnd(engine) - Date.now() : 0;
+    if (alive && engine.waiter) L.push('🔥 Кэш тёплый — Claude сейчас работает');
+    else if (left > 0) {
+      L.push(`🔥 Кэш тёплый ещё <b>${fmtDur(Math.round(left / 1000))}</b> — ответы быстрые и дешёвые`);
+    } else if (alive) L.push('🧊 Кэш остыл — первый ответ дороже');
+    else L.push('💤 Процесс спит — первый ответ дольше и дороже');
+    L.push(`♨️ Прогрев: <b>${state.warmHours ? `${state.warmHours} ч после сообщения` : 'выключен'}</b>` +
+           `${state.coolCompact ? ` • после — сжатие бесед от ${kTok(COOL_COMPACT_MIN)}` : ''}` +
+           `${alive && engine.noWarm ? ' • для этой беседы не удержал кэш' : ''}` +
+           `${alive && engine.stale ? ' • ждёт паузы, чтобы перейти на новый Claude Code' : ''}`);
+  }
 
   const ctx = lastContext();
   if (ctx) {
-    const share = Math.round((ctx / COMPACT_WINDOW) * 100);
-    const mark = ctx >= CTX_LIMIT ? '🔴' : ctx >= CTX_LIMIT * 0.6 ? '🟡' : '🟢';
-    L.push(`${mark} Контекст: <b>${kTok(ctx)}</b> из ${kTok(COMPACT_WINDOW)} (${share}%)`);
-    // Одно сообщение = несколько обращений к модели (чтение файла, команда,
-    // снова чтение), и каждое перечитывает весь контекст. Показываем цену.
-    const perMsg = ctx * 0.1 * 4;
-    L.push(`💸 Примерно <b>${kTok(perMsg)}</b> за сообщение` +
-           `${ctx >= CTX_LIMIT ? ' — <b>дорого</b>' : ''}`);
-    if (ctx >= CTX_LIMIT) L.push('<i>Новая беседа снизит это в разы и стоит дешевле сжатия</i>');
+    const win = viaGem ? GEMINI_COMPACT_WINDOW : COMPACT_WINDOW;
+    const share = Math.round((ctx / win) * 100);
+    const mark = viaGem ? (share >= 85 ? '🔴' : share >= 60 ? '🟡' : '🟢') : ctx >= CTX_LIMIT ? '🔴' : ctx >= CTX_LIMIT * 0.6 ? '🟡' : '🟢';
+    L.push(`${mark} Контекст: <b>${kTok(ctx)}</b> из ${kTok(win)} (${share}%)`);
+    if (viaGem) {
+      if (share >= 85) L.push('<i>Скоро Claude Code сожмёт беседу сам: у Gemini запрос длиннее 200к токенов вдвое дороже</i>');
+    } else {
+      // Одно сообщение = несколько обращений к модели (чтение файла, команда,
+      // снова чтение), и каждое перечитывает весь контекст. Показываем цену.
+      const perMsg = ctx * 0.1 * 4;
+      L.push(`💸 Примерно <b>${kTok(perMsg)}</b> за сообщение` +
+             `${ctx >= CTX_LIMIT ? ' — <b>дорого</b>' : ''}`);
+      if (ctx >= CTX_LIMIT) L.push('<i>Новая беседа снизит это в разы и стоит дешевле сжатия</i>');
+    }
   }
   L.push(`✂️ Краткие ответы: <b>${state.brief ? 'да' : 'нет'}</b>`);
-  if (['high', 'xhigh', 'max'].includes(state.effort)) {
+  if (!viaGem && ['high', 'xhigh', 'max'].includes(state.effort)) {
     L.push(`💸 Усилие <b>${esc(state.effort)}</b> — долгие размышления, лимит тает быстрее`);
   }
 
@@ -2448,7 +2615,7 @@ const HELP =
 /project — выбрать проект
 /newproject имя — создать новый проект
 /status — проект, модель, кэш, память
-/model — модель, усилие, режим
+/model — модель (Claude, а при ключе Google ещё и Gemini), усилие, режим
 /warm — прогрев кэша и сжатие перед паузой
 /translate — перевод на английский и обратно: дешевле по токенам
 /limits — остаток лимитов подписки
@@ -2458,8 +2625,9 @@ const HELP =
 /new — начать беседу заново
 /stop — прервать задачу и очистить очередь
 
-<b>Два режима</b> (переключаются в /model)
+<b>Три режима</b> (переключаются в /model)
 🛠 Разработка — Claude читает и правит файлы, запускает команды и тесты, работает с git.
+📝 План — Claude только читает и выдаёт план работ; под планом кнопка «Выполнить» переключает в разработку и запускает его.
 💬 Обсуждение — без доступа к файлам: быстрые ответы, расчёты, разбор идей.
 
 <b>Фото и файлы</b>
@@ -2471,7 +2639,10 @@ const HELP =
 <b>Перевод</b>
 Сообщения уходят к Claude по-английски, а ответы возвращаются по-русски: кириллица стоит Claude дороже английского (по замерам на журналах бота экономия порядка 10% расхода, точную цифру покажет /translate). Переводит Haiku по вашей подписке (или DeepSeek, если в настройках сервера есть его ключ). Под ответом есть кнопка «Оригинал». Включить, выключить и проверить — /translate.
 
-Длинные ответы приходят файлом. Долгие задачи идут в фоне — уведомление придёт само.`;
+Длинные ответы приходят файлом. Долгие задачи идут в фоне — уведомление придёт само.
+
+<b>Gemini</b>
+Если на сервере задан ключ Google Cloud (GEMINI_KEY_FILE), в /model появляются модели Gemini. Беседа общая с Claude: переключились — и Gemini видит всю историю проекта, правит файлы и запускает команды теми же инструментами; вернулись на Claude — он видит, что сделал Gemini. Удобно, когда лимит подписки кончился. Оплата — деньгами Google Cloud, а не подпиской; расход и потолок на сутки — в /limits.`;
 
 // ─────────────────────────── Роутер ───────────────────────────
 
@@ -2680,6 +2851,9 @@ function forgetContext() {
 /** После задачи: если контекст разросся — сжимаем сами и сообщаем об этом. */
 async function autoCompact() {
   if (!state.autoCompact) return;
+  // Здесь экономится лимит подписки Claude. У Gemini своих сроков кэша и лимитов нет: беседу при заполнении окна
+  // сжимает сам Claude Code (см. GEMINI_COMPACT_WINDOW)
+  if (isGem(state.model)) return;
   const ctx = lastContext();
   if (ctx < CTX_LIMIT || isBusy()) return;
 
@@ -2826,15 +3000,31 @@ async function handleCallback(cq) {
     return send(`✅ Проект: <b>${esc(name)}</b>\n<code>${esc(state.activeProject)}</code>`);
   }
   if (data.startsWith('m:')) {
+    const want = data.slice(2);
+    if (isGem(want) && !bridge) return send('❌ Моделей Google нет: в настройках сервера не задан ключ <code>GEMINI_KEY_FILE</code>.');
     const was = state.model;
-    state.model = data.slice(2); saveState();
+    state.model = want; saveState();
     if (was !== state.model) killEngine('сменилась модель');
     const ctx = lastContext();
+    if (isGem(want)) {
+      return send(
+        `🤖 Модель: <b>${esc(modelLabel(want))}</b>` +
+        (was !== want
+          ? `\n\n<i>Беседа общая: Gemini видит всю историю проекта и работает теми же инструментами. ` +
+            `Первое сообщение загрузит беседу заново${ctx ? ` (${kTok(ctx)} токенов)` : ''}. ` +
+            `Расход идёт деньгами Google Cloud (${gemPrice(want)} за млн токенов, вход / выход), ` +
+            `сегодня потрачено ${gemUsd(bridge.spend.today())}${bridge.dailyUsd > 0 ? ` из потолка ${gemUsd(bridge.dailyUsd)}` : ''}. ` +
+            `Вернуться на Claude — /model.</i>`
+          : ''));
+    }
     return send(
       `🤖 Модель: <b>${esc(modelLabel(state.model))}</b>` +
       (was !== state.model
-        ? `\n\n<i>Кэш у каждой модели свой, поэтому первое сообщение перепишет ` +
-          `беседу в кэш заново${ctx ? ` (≈ ${kTok(ctx * 2)})` : ''} — дальше как обычно.</i>`
+        ? (isGem(was)
+          ? `\n\n<i>Беседа общая: Claude видит всё, что сделал ${esc(modelLabel(was))}. Кэш у Claude свой, поэтому первое ` +
+            `сообщение запишет беседу в него заново${ctx ? ` (≈ ${kTok(ctx * 2)})` : ''} — дальше как обычно.</i>`
+          : `\n\n<i>Кэш у каждой модели свой, поэтому первое сообщение перепишет ` +
+            `беседу в кэш заново${ctx ? ` (≈ ${kTok(ctx * 2)})` : ''} — дальше как обычно.</i>`)
         : '')
     );
   }
@@ -2860,8 +3050,14 @@ async function handleCallback(cq) {
     const v = data.slice(2);
     state.effort = state.effort === v ? '' : v; saveState();
     const pricey = ['high', 'xhigh', 'max'].includes(state.effort);
+    const level = gemThinking(state.effort);
     return send(`⚙️ Усилие: <b>${esc(state.effort || 'обычное')}</b>` +
-      (pricey ? `\n\n💸 <i>Это режим долгих размышлений. Они идут в выхлоп, ` +
+      (isGem(state.model) && bridge
+        ? `\n\n🔷 Размышления Gemini: <b>${level}</b>. ` + (level === 'high'
+          ? `<i>Это обычный уровень Gemini: high, xhigh и max для него одно и то же.</i>`
+          : `<i>Меньше размышлений — быстрее и дешевле (они оплачиваются как выход модели), но сложные правки ` +
+            `могут выйти хуже. Вернуть обычный уровень — кнопка «обычное».</i>`)
+        : pricey ? `\n\n💸 <i>Это режим долгих размышлений. Они идут в выхлоп, ` +
                 `который стоит впятеро дороже ввода — лимит будет таять заметно быстрее. ` +
                 `Для обычных задач хватает обычного усилия.</i>` : ''));
   }
@@ -2869,7 +3065,9 @@ async function handleCallback(cq) {
     state.mode = data.slice(5); saveState();
     return send(state.mode === 'talk'
       ? '💬 Режим обсуждения: без доступа к файлам, быстрые ответы и расчёты.'
-      : '🛠 Режим разработки: полный доступ к файлам, командам и git.');
+      : state.mode === 'plan'
+        ? '📝 Режим плана: Claude читает код и данные, ничего не меняет и выдаёт план. Под планом будет кнопка «Выполнить».'
+        : '🛠 Режим разработки: полный доступ к файлам, командам и git.');
   }
   if (data.startsWith('g:')) {
     if (!state.activeProject) return send('❌ Проект не выбран');
@@ -2923,6 +3121,13 @@ async function handleCallback(cq) {
   if (data === 'act:orig') {
     if (!state.lastOriginal) return send('🤷 Оригинала нет: последний ответ пришёл без перевода.');
     return deliver(state.lastOriginal, '🇬🇧 <b>Оригинал ответа</b> — до перевода');
+  }
+  if (data === 'act:gemtest') return cmdGemTest();
+  if (data === 'act:planrun') {
+    if (!state.activeProject) return screenProjects();
+    state.mode = 'dev'; saveState();
+    return submit({ text: 'Carry out the plan you just gave, step by step.', words: 'Выполняй составленный план.',
+                    notes: '', blocks: [], label: '▶️ выполнение плана' });
   }
   if (data === 'act:limits') return screenUsage(true); // кнопка — всегда свежие данные
   if (data === 'act:compact') return cmdCompact();
@@ -3138,7 +3343,7 @@ async function transcribe(src) {
                   '-sns', '-nt', '-np', '-t', '1'];
     // Окно whisper рассчитано на 30 секунд — короткой записи хватает части:
     // 50 позиций на секунду с запасом, кратно 64. Короткие голосовые так заметно быстрее.
-    if (secs < 28) args.push('-ac', String(Math.ceil(((secs + 2) * 50) / 64) * 64));
+    if (secs < 28) args.push('-ac', String(Math.min(1500, Math.ceil(((secs + 2) * 50) / 64) * 64)));
     const out = await run(WHISPER_BIN, args, Math.min(30 * 60000, 120000 + secs * 3000));
     return { text: cleanTranscript(out), secs, cut: secs >= AUDIO_MAX_S - 1 };
   } finally { rm(wav); }
@@ -3409,6 +3614,7 @@ function shutdown(sig) {
   if (isBusy()) stopChild('перезапуск сервиса');
   killEngine('остановка сервиса');
   for (const k of trKids) { try { k.kill('SIGKILL'); } catch {} }     // переводчик живёт секунды, но осиротеть не должен
+  if (bridge) bridge.close().catch(() => {});
   setTimeout(() => process.exit(0), 1500);
 }
 
@@ -3424,6 +3630,16 @@ process.on('uncaughtException', (e) => log('ERROR', `Необработанно�
     const me = await tg('getMe');
     log('INFO', `Подключён как @${me.username}`);
   } catch (e) { fatal(`Не удалось подключиться к Telegram: ${e.message}`); }
+
+  await startGemini();
+  if (isGem(state.model) && !bridge) {
+    // Ключ убрали или он не читается: Claude Code отправил бы модель Google в Anthropic и получил бы отказ
+    log('WARN', 'Выбрана модель Google, а моста нет — возвращаю Opus', { модель: state.model });
+    const was = state.model;
+    state.model = 'opus'; saveState();
+    send(`⚠️ Была выбрана модель <b>${esc(was)}</b>, но Google не подключён (нет ключа или он не читается — подробности в журнале). ` +
+         `Вернул <b>Opus</b>.`).catch(() => {});
+  }
 
   await tg('setMyCommands', { commands: [
     { command: 'project', description: '📁 выбрать проект' },
@@ -3470,6 +3686,29 @@ process.on('uncaughtException', (e) => log('ERROR', `Необработанно�
     await send('♻️ Бот перезапущен', { disable_notification: true }).catch(() => {});
   }
   if (offAtBoot) await send(trOffText()).catch(() => {});
+  if (bridge) {
+    // Настоящий короткий запрос к модели: сразу видно, принимает ли Google ключ, а не только читается ли файл.
+    // Про Google рассказываем, только когда он ответил: «подключён», за которым идёт «не отвечает», сбивало бы с толку
+    bridge.probe().then(async (r) => {
+      log(r.ok ? 'INFO' : 'WARN', 'Проверка связи с Google при запуске', { модель: r.model, ok: r.ok, мс: r.ms, ...(r.ok ? {} : { ошибка: r.error.slice(0, 200) }) });
+      if (!r.ok) {
+        await send(`⚠️ <b>Gemini не отвечает</b>\n\n<code>${esc(r.error)}</code>\n\n` +
+          `Частые причины: не включён Vertex AI API в проекте <code>${esc(bridge.project)}</code>, у сервисного аккаунта нет роли ` +
+          `«Vertex AI User», ключ отозван. Claude это не мешает; повторить проверку — кнопка в /model.`).catch(() => {});
+        return;
+      }
+      if (state.gemAnnounced) return;
+      state.gemAnnounced = true; saveState();
+      const price = bridge.models[0] && gemPrice(bridge.models[0].id);
+      await send(`🔷 <b>Модели Google подключены</b>\n\n` +
+        `В /model появились Gemini (Vertex AI): ${bridge.models.map((m) => esc(m.label)).join(', ')}. Беседа общая с Claude: ` +
+        `переключились — и Gemini видит всю историю проекта, правит файлы и запускает команды теми же инструментами; ` +
+        `вернулись на Claude — он видит, что сделал Gemini. Пригодится, когда лимит подписки кончился.\n\n` +
+        `Это не подписка Claude, а деньги Google Cloud${price ? ` (${esc(bridge.models[0].label)}: ${price} за млн токенов, вход / выход)` : ''}. ` +
+        `Сегодня потрачено ${gemUsd(bridge.spend.today())}${bridge.dailyUsd > 0 ? `, потолок на сутки ${gemUsd(bridge.dailyUsd)}` : ''}. ` +
+        `Расход — в /limits, проверка связи — кнопка в /model.`).catch(() => {});
+    }).catch(() => {});
+  }
   // Перевод заработал позже (появился ключ) — один раз говорим об этом: отвечать Claude теперь будет по-английски
   if (translateOn() && !state.trAnnounced) {
     state.trAnnounced = true; saveState();

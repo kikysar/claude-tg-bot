@@ -7,9 +7,10 @@
 #   1. сверяется с origin; нового нет — выходит;
 #   2. если бот занят (идёт задача или только что писали), откладывает до
 #      следующего раза: перезапуск оборвал бы задачу и сбросил тёплый кэш;
-#   3. подтягивает коммиты; бота перезапускает, только если изменился bot.js,
-#      правки README, тестов и limits.sh перезапуска не требуют;
-#   4. проверяет синтаксис bot.js до замены и что бот не падает после
+#   3. подтягивает коммиты; бота перезапускает, только если изменился bot.js
+#      или gemini.js (мост к моделям Google), правки README, тестов и limits.sh
+#      перезапуска не требуют;
+#   4. проверяет синтаксис bot.js и gemini.js до замены и что бот не падает после
 #      перезапуска. Иначе возвращает прежнюю версию и эту больше не пробует.
 # Об отказах пишет владельцу установки в Telegram. Об успехе бот объявит сам:
 # при запуске новой версии он присылает «Бот обновлён».
@@ -92,19 +93,22 @@ main() {
   fi
 
   changed=$(git diff --name-only "$old" "$new")
-  grep -qx 'bot.js' <<<"$changed" && restart=1
+  grep -qxE 'bot\.js|gemini\.js' <<<"$changed" && restart=1
   if [ "$restart" = 1 ] && busy; then
     echo "Бот занят, обновление до $(short "$new") отложено"; return 0
   fi
 
-  # Синтаксис проверяем до замены файла: сломанную версию на диск не кладём
+  # Синтаксис проверяем до замены файлов: сломанную версию на диск не кладём
   if [ "$restart" = 1 ] && command -v "$NODE" >/dev/null 2>&1; then
-    local tmp; tmp=$(mktemp -d)
-    git show "$new:bot.js" > "$tmp/bot.js"
-    if ! "$NODE" --check "$tmp/bot.js" 2>/dev/null; then
-      rm -rf "$tmp"; echo "$new" > "$STATE/bad"
-      fail "в версии $(short "$new") ошибка в bot.js, остаюсь на $(short "$old")"
-    fi
+    local tmp f; tmp=$(mktemp -d)
+    for f in bot.js gemini.js; do
+      git cat-file -e "$new:$f" 2>/dev/null || continue
+      git show "$new:$f" > "$tmp/$f"
+      if ! "$NODE" --check "$tmp/$f" 2>/dev/null; then
+        rm -rf "$tmp"; echo "$new" > "$STATE/bad"
+        fail "в версии $(short "$new") ошибка в $f, остаюсь на $(short "$old")"
+      fi
+    done
     rm -rf "$tmp"
   fi
 
@@ -116,7 +120,7 @@ main() {
     echo "Внимание: изменились файлы в deploy/. Скрипт обновления и юниты ставятся копированием, сам скрипт их не меняет"
     notify "ℹ️ Автообновление бота: в репозитории изменились файлы в deploy/ (скрипт обновления или юниты systemd). Бот обновился, а их нужно поставить заново: попросите Claude сделать это по инструкции в README, шаги 5 и 6."
   fi
-  [ "$restart" = 1 ] || { echo "bot.js не менялся, перезапуск не нужен"; return 0; }
+  [ "$restart" = 1 ] || { echo "bot.js и gemini.js не менялись, перезапуск не нужен"; return 0; }
 
   systemctl restart "$SERVICE"
   local before; before=$(nrestarts)
