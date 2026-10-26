@@ -437,6 +437,9 @@ function toGemini(body, ctx) {
     if (parts.length) contents.push({ role: 'user', parts });
   }
   if (contents.length && contents[0].role !== 'user') contents.unshift({ role: 'user', parts: [{ text: '(the conversation continues)' }] });
+  // Vertex не принимает запрос, который заканчивается репликой модели (последнюю реплику пользователя могли отбросить пустой,
+  // или Claude Code прислал беседу, оборванную на ответе): просим продолжить
+  if (contents.length && contents[contents.length - 1].role === 'model') contents.push({ role: 'user', parts: [{ text: '(continue)' }] });
 
   // Системная инструкция: вступление моста + системный промпт Claude Code без служебной строки биллинга
   const sysTexts = [];
