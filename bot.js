@@ -76,7 +76,7 @@ const NO_AGENT_ENV = {
   CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS: '1',
 };
 
-const BOT_VERSION = '2026-10-26.1';
+const BOT_VERSION = '2026-10-27.1';
 
 // Режим плана: тот же английский для экономии, что и у остальных подсказок
 const PLAN_EN = 'Plan mode: change nothing and run no command that modifies anything. Study the code and data, then give a ' +
@@ -85,8 +85,8 @@ const PLAN_EN = 'Plan mode: change nothing and run no command that modifies anyt
 
 /** «Что нового» после обновления: про перевод — по тому, включён ли он на самом деле. */
 function whatsNew() {
-  const head = '♻️ <b>Бот обновлён</b>\n\n📝 <b>Новый режим — план</b> (в /model): Claude читает код и данные, ничего не меняет и выдаёт план, ' +
-    'а кнопка «▶️ Выполнить план» под ним запускает работу. Ещё починил голосовые длиной около 28 секунд.\n\n';
+  const head = '♻️ <b>Бот обновлён</b>\n\n🗄 <b>Копии бесед:</b> в 12:00 и 00:00 бот присылает архив всех бесед в этот чат (первая копия полная, дальше только изменения), по команде — /backup.\n' +
+    '📝 Режим плана теперь и командой /plan. Убраны редко нужные команды: состояние, прогрев, беседы проекта, сжать, git, начать заново, помощь.\n\n';
   if (!translateOn()) {
     return `${head}🌐 В боте есть перевод: сообщения уходят к Claude по-английски, а ответы возвращаются по-русски, ` +
       `так лимит тает медленнее. Сейчас он выключен — включить и проверить: /translate.`;
@@ -218,9 +218,9 @@ function tgDocument(filename, content, caption) {
     if (caption) field('parse_mode', 'HTML');
     parts.push(Buffer.from(
       `--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="${filename}"\r\n` +
-      `Content-Type: text/markdown\r\n\r\n`
+      `Content-Type: ${Buffer.isBuffer(content) ? 'application/octet-stream' : 'text/markdown'}\r\n\r\n`
     ));
-    parts.push(Buffer.from(content, 'utf8'));
+    parts.push(Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8'));
     parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
     const body = Buffer.concat(parts);
 
@@ -232,7 +232,7 @@ function tgDocument(filename, content, caption) {
         'Content-Type': `multipart/form-data; boundary=${boundary}`,
         'Content-Length': body.length,
       },
-      timeout: 120000,
+      timeout: Buffer.isBuffer(content) ? 900000 : 120000,
     }, (res) => {
       let data = '';
       res.on('data', (c) => (data += c));
@@ -1934,20 +1934,11 @@ function plural(n, one, few, many) {
  * оплачивается заново при каждом холодном старте.
  */
 function taskKeyboard({ original = false, plan = false } = {}) {
-  const rows = [[
-    { text: '🆕 Новая беседа', callback_data: 'act:newask' },
-    { text: '📊 Статус', callback_data: 'act:status' },
-  ]];
+  const rows = [];
   // Ответ пришёл через переводчика — оригинал под рукой, если перевод кажется кривым
   if (original) rows.push([{ text: '🇬🇧 Оригинал ответа', callback_data: 'act:orig' }]);
   if (plan) rows.unshift([{ text: '▶️ Выполнить план', callback_data: 'act:planrun' }]);
-  // На разросшейся беседе предлагаем начать новую, а не сжимать: сжатие
-  // перечитывает весь диалог и стоит примерно как он сам, а новая беседа
-  // стартует почти с нуля. Память проекта при этом никуда не девается.
-  if (lastContext() >= CTX_LIMIT && !isGem(state.model)) {
-    rows.unshift([{ text: '🆕 Начать новую — дешевле', callback_data: 'act:newask' }]);
-  }
-  return { inline_keyboard: rows };
+  return rows.length ? { inline_keyboard: rows } : undefined;
 }
 
 /**
@@ -2614,15 +2605,11 @@ const HELP =
 <b>Команды</b> — все в меню слева от поля ввода
 /project — выбрать проект
 /newproject имя — создать новый проект
-/status — проект, модель, кэш, память
 /model — модель (Claude, а при ключе Google ещё и Gemini), усилие, режим
-/warm — прогрев кэша и сжатие перед паузой
+/plan — режим плана: включить / выключить
 /translate — перевод на английский и обратно: дешевле по токенам
 /limits — остаток лимитов подписки
-/sessions — переключиться между беседами
-/compact — сжать беседу, если разрослась
-/git — статус, изменения, история, pull/push
-/new — начать беседу заново
+/backup — копия всех бесед в чат прямо сейчас (сама приходит в 12:00 и 00:00)
 /stop — прервать задачу и очистить очередь
 
 <b>Три режима</b> (переключаются в /model)
@@ -2643,6 +2630,100 @@ const HELP =
 
 <b>Gemini</b>
 Если на сервере задан ключ Google Cloud (GEMINI_KEY_FILE), в /model появляются модели Gemini. Беседа общая с Claude: переключились — и Gemini видит всю историю проекта, правит файлы и запускает команды теми же инструментами; вернулись на Claude — он видит, что сделал Gemini. Удобно, когда лимит подписки кончился. Оплата — деньгами Google Cloud, а не подпиской; расход и потолок на сутки — в /limits.`;
+
+/** /plan: включает режим плана, повторный вызов возвращает разработку. */
+function cmdPlan() {
+  state.mode = state.mode === 'plan' ? 'dev' : 'plan'; saveState();
+  return send(state.mode === 'plan'
+    ? '📝 Режим плана: Claude читает код и данные, ничего не меняет и выдаёт план. Под планом будет кнопка «Выполнить». Выключить — снова /plan.'
+    : '🛠 Режим разработки: полный доступ к файлам, командам и git.');
+}
+
+// ─────────────────────── Копии бесед в чат ───────────────────────
+// Беседы Claude Code лежат только на сервере. Дважды в сутки бот собирает их в архив и присылает в этот чат: пропадёт
+// доступ к серверу — копия останется в Telegram. Первая копия и раз в неделю — полная, между ними — только изменившиеся файлы.
+
+const BACKUP_UTC_OFFSET = Number(process.env.BACKUP_UTC_OFFSET ?? 7);        // часы 12:00 и 00:00 — по вашему времени (Таиланд, UTC+7)
+const BACKUP_HOURS = [0, 12];
+const BACKUP_PART = 45 * 1024 * 1024;                                       // Bot API принимает файлы до 50 МБ
+const BACKUP_DIR = path.join(path.dirname(STATE_FILE), 'backups');
+const CLAUDE_HOME = process.env.CLAUDE_HOME || path.join(process.env.HOME || '/home/claudebot', '.claude');
+let backupRunning = false;
+
+function changedFiles(dir, since, rel, out) {
+  let entries = [];
+  try { entries = fs.readdirSync(path.join(CLAUDE_HOME, rel), { withFileTypes: true }); } catch { return out; }
+  for (const e of entries) {
+    const r = path.join(rel, e.name);
+    if (e.isDirectory()) changedFiles(dir, since, r, out);
+    else if (e.isFile()) {
+      try { if (fs.statSync(path.join(CLAUDE_HOME, r)).mtimeMs > since) out.push(r); } catch {}
+    }
+  }
+  return out;
+}
+
+async function runBackup(how) {
+  const manual = how === 'manual';
+  if (backupRunning) return manual ? send('⏳ Копия уже собирается.') : null;
+  backupRunning = true;
+  const b = state.backup = state.backup || {};
+  const started = Date.now();
+  try {
+    const full = !b.at || !b.fullAt || started - b.fullAt > 7 * 86400e3 || how === 'full';
+    if (manual) await send(`🗄 Собираю ${full ? 'полную копию' : 'копию изменений'} бесед…`);
+    const files = changedFiles(CLAUDE_HOME, full ? 0 : b.at - 120e3, 'projects', []);
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    const local = new Date(started + BACKUP_UTC_OFFSET * 3600e3).toISOString();
+    const stamp = `${local.slice(0, 10)}_${local.slice(11, 16).replace(':', '-')}`;
+    const name = `besedy-${stamp}-${full ? 'polnaya' : 'izmeneniya'}.tar.gz`;
+    const out = path.join(BACKUP_DIR, name), list = `${out}.list`;
+    fs.writeFileSync(list, files.length ? `${files.join('\n')}\n` : '');
+    await run('nice', ['-n', '10', 'tar', '-czf', out, '-C', CLAUDE_HOME, '-T', list,
+                       '-C', path.dirname(STATE_FILE), path.basename(STATE_FILE)], 20 * 60e3);
+    fs.rmSync(list, { force: true });
+
+    const size = fs.statSync(out).size, n = Math.max(1, Math.ceil(size / BACKUP_PART));
+    const mb = (size / 1048576).toFixed(1);
+    const when = local.slice(8, 10) + '.' + local.slice(5, 7) + ' ' + local.slice(11, 16);
+    const fd = fs.openSync(out, 'r');
+    try {
+      for (let i = 0; i < n; i++) {
+        const buf = Buffer.alloc(Math.min(BACKUP_PART, size - i * BACKUP_PART));
+        fs.readSync(fd, buf, 0, buf.length, i * BACKUP_PART);
+        const fname = n > 1 ? `${name}.${String(i + 1).padStart(3, '0')}` : name;
+        const cap = `🗄 <b>Копия бесед</b> • ${when} • ${full ? 'полная' : `изменения: ${files.length} файл.`} • ${mb} МБ` +
+          (n > 1 ? ` • часть ${i + 1}/${n}` : '') +
+          (i === 0 ? `\n<i>Восстановить: ${n > 1 ? `cat ${esc(name)}.* > ${esc(name)} ; ` : ''}tar xzf ${esc(name)} -C ~/.claude (полную копию первой, изменения поверх неё по порядку дат). ` +
+                     `Состояние бота — state.json в корне архива.</i>` : '');
+        await tgDocument(fname, buf, cap);
+      }
+    } finally { fs.closeSync(fd); }
+
+    b.at = started; if (full) b.fullAt = started; saveState();
+    log('INFO', 'Копия бесд отправлена', { тип: full ? 'полная' : 'изменения', файлов: files.length, МБ: Number(mb), частей: n, секунд: Math.round((Date.now() - started) / 1000) });
+    // На диске храним пять последних архивов, остальное лежит в чате
+    const old = fs.readdirSync(BACKUP_DIR).filter((f) => f.endsWith('.tar.gz')).sort().slice(0, -5);
+    for (const f of old) fs.rmSync(path.join(BACKUP_DIR, f), { force: true });
+  } catch (e) {
+    log('ERROR', `Копия бесед: ${e.message}`);
+    await send(`❌ <b>Копия бесед не удалась</b>\n\n<pre>${esc(String(e.message).slice(0, 500))}</pre>`).catch(() => {});
+  } finally { backupRunning = false; }
+  return null;
+}
+
+/** Раз в минуту смотрит на часы: в 12:00 и 00:00 по вашему времени (в пределах часа) делает копию, один раз на срок. */
+function scheduleBackups() {
+  if (process.env.BACKUP_OFF) return;   // проверки бота не должны собирать настоящие беседы
+  setInterval(() => {
+    const local = new Date(Date.now() + BACKUP_UTC_OFFSET * 3600e3);
+    if (!BACKUP_HOURS.includes(local.getUTCHours())) return;
+    const slot = local.toISOString().slice(0, 13);
+    if ((state.backup || {}).slot === slot || backupRunning) return;
+    state.backup = { ...(state.backup || {}), slot }; saveState();
+    runBackup('auto').catch(() => {});
+  }, 60e3);
+}
 
 // ─────────────────────────── Роутер ───────────────────────────
 
@@ -2961,21 +3042,24 @@ async function route(text) {
     case '/start':
       // заодно убираем нижнюю клавиатуру, если она осталась от прошлых версий
       return send(`👋 <b>Готов к работе</b>\n\n${HELP}`, { reply_markup: noKeyboard });
-    case '/help': return send(HELP);
     case '/project': return cmdProject(arg);
     case '/newproject': return cmdNewProject(arg);
-    case '/status': return screenStatus();
     case '/model': return screenModel();
+    case '/plan': return cmdPlan();
+    // Убраны из меню и справки (ими не пользовались), но набранные вручную работают
+    case '/help': return send(HELP);
+    case '/status': return screenStatus();
     case '/warm': return screenWarm();
-    case '/translate': return screenTranslate();
-    case '/usage': return screenUsage();
-    case '/limits': return screenUsage();
     case '/git': return screenGit();
     case '/sessions': return screenSessions();
     case '/compact': return cmdCompact();
+    case '/new': return askNewSession();
+    case '/backup': return runBackup('manual');
+    case '/translate': return screenTranslate();
+    case '/usage': return screenUsage();
+    case '/limits': return screenUsage();
     case '/autocompact': return cmdAutoCompact();
     case '/brief': return cmdBrief();
-    case '/new': return askNewSession();
     case '/stop':
     case '/cancel': return cmdCancel();
     default:
@@ -3641,20 +3725,17 @@ process.on('uncaughtException', (e) => log('ERROR', `Необработанно�
          `Вернул <b>Opus</b>.`).catch(() => {});
   }
 
+  scheduleBackups();
+
   await tg('setMyCommands', { commands: [
     { command: 'project', description: '📁 выбрать проект' },
     { command: 'newproject', description: '➕ создать проект' },
-    { command: 'status', description: '📊 состояние' },
     { command: 'model', description: '🤖 модель и режим' },
-    { command: 'warm', description: '🔥 прогрев кэша' },
+    { command: 'plan', description: '📝 режим плана' },
     { command: 'translate', description: '🌐 перевод: экономия токенов' },
     { command: 'limits', description: '📈 остаток лимитов' },
-    { command: 'sessions', description: '🧵 беседы проекта' },
-    { command: 'compact', description: '🗜 сжать беседу' },
-    { command: 'git', description: '🔀 git' },
-    { command: 'new', description: '🆕 начать заново' },
+    { command: 'backup', description: '🗄 копия бесед в чат' },
     { command: 'stop', description: '⛔ остановить задачу' },
-    { command: 'help', description: '❓ помощь' },
   ] }).catch(() => {});
 
   // Версию CLI и каталог моделей — сразу, чтобы меню знало номера моделей.

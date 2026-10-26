@@ -29,6 +29,8 @@ env.FAKE_LOG = path.join(tmp, 'fake.log');
 env.FAKE_COLD = path.join(tmp, 'cold.flag');
 env.FAKE_SLOW = path.join(tmp, 'slow.flag');
 env.FAKE_RATE = path.join(tmp, 'rate.json');
+env.BACKUP_OFF = '1';                                     // автокопия по часам в проверках не нужна, /backup вызываем сами
+env.CLAUDE_HOME = path.join(tmp, 'claude-home');
 env.FAKE_GONE = path.join(tmp, 'gone.txt');            // номера бесед, файлов которых «на сервере уже нет»
 env.FAKE_GONE_SILENT = path.join(tmp, 'gone-silent.flag');   // при пропавшей беседе Claude Code не присылает итог, а выходит с ошибкой в stderr
 env.MEMINFO_FILE = path.join(tmp, 'meminfo');      // сколько памяти «свободно» для переводчика через Claude Code
@@ -888,7 +890,9 @@ let c14r = 0;
   if (BOOT) return bootCase();
   if (REAL_BIN) return realCase();
   await waitFor('старт', () => texts().some((t) => t.includes('Бот обновлён')));
-  check('меню: есть /warm', calls.find((c) => c.method === 'setMyCommands').payload.commands.some((c) => c.command === 'warm'));
+  { const cmds = calls.find((c) => c.method === 'setMyCommands').payload.commands.map((c) => c.command);
+    check('меню: есть /plan и /backup', cmds.includes('plan') && cmds.includes('backup'), cmds);
+    check('меню: нет убранных команд', !['status', 'warm', 'sessions', 'compact', 'git', 'new', 'help'].some((c) => cmds.includes(c)), cmds); }
 
   out('1. Задача и прогрев');
   button('p:demo');
@@ -1056,12 +1060,12 @@ let c14r = 0;
   text('/model');
   await waitFor('модель', () => texts().some((t) => t.includes('Модель и режим')));
   const mm = lastWith('Модель и режим').payload;
-  const btns = mm.reply_markup.inline_keyboard.flat().map((x) => x.text);
+  const btns = (mm.reply_markup || { inline_keyboard: [] }).inline_keyboard.flat().map((x) => x.text);
   check('меню моделей с номерами', btns.includes('✅ Opus 5.5 — для сложной и повседневной работы') &&
         btns.includes('Sonnet 5.5 — быстрее и легче') && btns.includes('Haiku 4.5 — самая быстрая'), btns);
   // Ключа Google на сервере нет — как у всех, кто бота не трогал: ничего про Gemini не появляется
   check('без ключа Google: в меню нет Gemini и проверки связи, под меню ни слова про Vertex',
-        !btns.some((x) => /Gemini/.test(x)) && !mm.reply_markup.inline_keyboard.flat().some((x) => /gemini|gemtest/.test(x.callback_data)) && !mm.text.includes('Vertex'), mm);
+        !btns.some((x) => /Gemini/.test(x)) && !(mm.reply_markup || { inline_keyboard: [] }).inline_keyboard.flat().some((x) => /gemini|gemtest/.test(x.callback_data)) && !mm.text.includes('Vertex'), mm);
   check('без ключа Google: в статусе нет Gemini и объявлений про Google не было', !sTxt.includes('Gemini') && !texts().some((t) => t.includes('Модели Google')), sTxt);
 
   out('11. /compact');
@@ -1117,7 +1121,7 @@ let c14r = 0;
   text('/warm');
   await waitFor('экран', () => texts().filter((t) => t.includes('Прогрев кэша')).length >= 2);
   const wTxt = lastWith('Прогрев кэша').payload;
-  check('экран: выключатель и учёт сжатий', wTxt.reply_markup.inline_keyboard.flat().some((x) => x.callback_data === 'wc') &&
+  check('экран: выключатель и учёт сжатий', (wTxt.reply_markup || { inline_keyboard: [] }).inline_keyboard.flat().some((x) => x.callback_data === 'wc') &&
         wTxt.text.includes('сжатий перед остыванием: 2'), wTxt.text);
   button('wc');
   await waitFor('выключено', () => texts().some((t) => t.includes('Сжатие перед остыванием выключено')));
@@ -1245,7 +1249,7 @@ let c14r = 0;
   await waitFor('экран перевода', () => textsFrom(c14).some((t) => t.includes('Перевод через DeepSeek')));
   let tr14 = lastWith('Перевод через DeepSeek').payload;
   check('экран: выключен, модель, кнопка включения', tr14.text.includes('<b>выключен</b>') && tr14.text.includes('deepseek-flash') &&
-        tr14.reply_markup.inline_keyboard.flat().some((x) => x.callback_data === 'tr:on'), tr14);
+        (tr14.reply_markup || { inline_keyboard: [] }).inline_keyboard.flat().some((x) => x.callback_data === 'tr:on'), tr14);
   check('экран: прямо сказано, что уходит в DeepSeek', tr14.text.includes('Что уходит в DeepSeek') && !tr14.text.includes(DS_KEY));
 
   // выбран перевод по ключу, а ключа нет: включить нечего, экран подсказывает, куда его вписать.
@@ -1296,7 +1300,7 @@ let c14r = 0;
   check('ключ переводчика до Claude не доходит', lastStart().leak === false, lastStart());
   const ans14 = [...sentFrom(c14)].reverse().find((x) => x.payload.text.includes('RU[Answer to'));
   check('в итоге значок перевода и кнопка оригинала', ans14.payload.text.includes('• 🌐') &&
-        ans14.payload.reply_markup.inline_keyboard.flat().some((x) => x.callback_data === 'act:orig'), ans14.payload);
+        (ans14.payload.reply_markup || { inline_keyboard: [] }).inline_keyboard.flat().some((x) => x.callback_data === 'act:orig'), ans14.payload);
   const st14 = statusOf(c14);
   check('в статусе значок перевода', st14.payload.text.includes('• 🌐'), st14.payload.text);
   check('пока переводится ответ — статус «Перевожу», потом убран',
@@ -1339,7 +1343,7 @@ let c14r = 0;
         warn14.text.includes('ответ остался на английском') && warn14.text.includes('🌐⚠️') &&
         warn14.text.includes('<code>config.json</code>') && !warn14.text.includes('RU['), warn14.text);
   check('неудачный ответ — один запрос, без повторов', ds.slice(d14).filter((x) => x.dir === 'out').length === 1);
-  check('показывать «Оригинал» нечего — кнопки нет', !warn14.reply_markup.inline_keyboard.flat().some((x) => x.callback_data === 'act:orig'));
+  check('показывать «Оригинал» нечего — кнопки нет', !(warn14.reply_markup || { inline_keyboard: [] }).inline_keyboard.flat().some((x) => x.callback_data === 'act:orig'));
 
   // длинный ответ: кусками, параллельно, в правильном порядке
   c14 = calls.length; d14 = ds.length;
@@ -1380,7 +1384,7 @@ let c14r = 0;
   await waitFor('экран с цифрами', () => textsFrom(c14).some((t) => t.includes('Всего:')));
   tr14 = lastWith('Всего:').payload;
   check('экран: включён, расход и кнопки', tr14.text.includes('<b>включён</b>') && /Всего: <b>\d+<\/b>/.test(tr14.text) && tr14.text.includes('≈') &&
-        ['tr:off', 'tr:test'].every((d) => tr14.reply_markup.inline_keyboard.flat().some((x) => x.callback_data === d)), tr14.text);
+        ['tr:off', 'tr:test'].every((d) => (tr14.reply_markup || { inline_keyboard: [] }).inline_keyboard.flat().some((x) => x.callback_data === d)), tr14.text);
   check('расход переводчика учтён', st().tr.n >= 15 && st().tr.cost > 0 && st().tr.hit > 0, st().tr);
   c14 = calls.length;
   button('tr:test');
@@ -1530,7 +1534,7 @@ let c14r = 0;
     !scr.text.includes('Что уходит в DeepSeek') && !scr.text.includes('deepseek-flash') && !scr.text.includes('DEEPSEEK_API_KEY') &&
     !scr.text.includes('Перевод через DeepSeek'), scr.text);
   check('экран: прямо сказано, что уходит и куда', scr.text.includes('<b>Что уходит:</b>') && scr.text.includes('Anthropic') && scr.text.includes('сторонних сервисов нет'), scr.text);
-  check('экран: кнопки «Включить» и «Проверить»', ['tr:on', 'tr:test'].every((d) => scr.reply_markup.inline_keyboard.flat().some((x) => x.callback_data === d)));
+  check('экран: кнопки «Включить» и «Проверить»', ['tr:on', 'tr:test'].every((d) => (scr.reply_markup || { inline_keyboard: [] }).inline_keyboard.flat().some((x) => x.callback_data === d)));
 
   r15 = trRuns.length; c15 = await press('tr:on', (t) => t.includes('Перевод включён'));
   await sleepReal(40);
@@ -1575,7 +1579,7 @@ let c14r = 0;
   check('Claude просят отвечать по-английски, правила тоже по-английски', sysPrompt().includes('machine-translated') && sysPrompt().includes('Be brief') && !sysPrompt().includes('Отвечай кратко'), sysPrompt());
   check('ключ переводчика и токен подписки в беседе: ключа нет, вход на месте', lastStart().leak === false);
   const a15 = [...sentFrom(T.c)].reverse().find((x) => FINAL.test(x.payload.text));
-  check('значок перевода и кнопка оригинала', a15.payload.text.includes('• 🌐') && a15.payload.reply_markup.inline_keyboard.flat().some((x) => x.callback_data === 'act:orig'), a15.payload);
+  check('значок перевода и кнопка оригинала', a15.payload.text.includes('• 🌐') && (a15.payload.reply_markup || { inline_keyboard: [] }).inline_keyboard.flat().some((x) => x.callback_data === 'act:orig'), a15.payload);
   const s15 = statusOf(T.c);
   check('в статусе значок, пока переводится ответ — «Перевожу», потом статус убран',
     s15.payload.text.includes('• 🌐') && calls.slice(T.c).some((x) => x.method === 'editMessageText' && x.payload.message_id === s15.id && x.payload.text.includes('Перевожу ответ')) &&
@@ -1597,7 +1601,7 @@ let c14r = 0;
   check('экран с цифрами: вызовы, токены, «доли лимита, а не деньги», вклад в задачу',
     scr2.text.includes('<b>включён</b>') && scr2.text.includes('Haiku 5.5') && scr2.text.includes('по прайсу Haiku') && scr2.text.includes('доли лимита подписки') &&
     scr2.text.includes('Сам переводчик добавляет к задаче') && scr2.text.includes(`Всего: <b>${cs15.n}</b> (${cs15.nIn} туда, ${cs15.nOut} обратно)`), scr2.text);
-  check('экран: «Выключить» и «Проверить»', ['tr:off', 'tr:test'].every((d) => scr2.reply_markup.inline_keyboard.flat().some((x) => x.callback_data === d)));
+  check('экран: «Выключить» и «Проверить»', ['tr:off', 'tr:test'].every((d) => (scr2.reply_markup || { inline_keyboard: [] }).inline_keyboard.flat().some((x) => x.callback_data === d)));
   check('в /status — Haiku по подписке, включён', (await statusLine()).includes('Перевод: <b>включён</b> • Haiku по подписке'));
 
   // ── код, пути, цитаты не покидают бота ──
@@ -1637,7 +1641,7 @@ let c14r = 0;
   check('брак — один повтор, а не бесконечность: туда 1 вызов, обратно 2', T.runs.filter((r) => r.dir === 'in').length === 1 && T.runs.filter((r) => r.dir === 'out').length === 2, T.runs.map((r) => r.dir));
   await sleepReal(40);
   check('оба забракованных перевода учтены', bad15() - bad0 === 2, bad15() - bad0);
-  check('показывать «Оригинал» нечего — кнопки нет', !(sentFrom(T.c).find((x) => FINAL.test(x.payload.text)).payload.reply_markup.inline_keyboard.flat().some((x) => x.callback_data === 'act:orig')));
+  check('показывать «Оригинал» нечего — кнопки нет', !((sentFrom(T.c).find((x) => FINAL.test(x.payload.text)).payload.reply_markup || { inline_keyboard: [] }).inline_keyboard.flat().some((x) => x.callback_data === 'act:orig')));
 
   bad0 = bad15();
   const LANG = 'проверь язык перевода пожалуйста';
@@ -1824,7 +1828,7 @@ let c14r = 0;
     check(`${mode}: беседа вернулась к русским инструкциям`, sysPrompt().includes('Отвечай кратко') && !sysPrompt().includes('machine-translated'), sysPrompt());
     if (mode === 'wrongkey') check('wrongkey: процесс, вошедший по ключу, бот оборвал сам', trKills.length > k0 && trKills.includes('SIGKILL'), trKills);
     const sc = await screen15('Выключен автоматически');
-    check(`${mode}: экран объясняет, что выключено само, и предлагает включить`, sc.text.includes(phrase) && sc.reply_markup.inline_keyboard.flat().some((x) => x.callback_data === 'tr:on'), sc.text);
+    check(`${mode}: экран объясняет, что выключено само, и предлагает включить`, sc.text.includes(phrase) && (sc.reply_markup || { inline_keyboard: [] }).inline_keyboard.flat().some((x) => x.callback_data === 'tr:on'), sc.text);
     // пока причина не устранена, «Включить» не включает
     const rBefore = trRuns.length;
     c15 = await press('tr:on', (t) => t.includes('Перевод не включён'));
@@ -1975,6 +1979,29 @@ let c14r = 0;
   const runStart = fakeLog().slice(bP).filter((x) => x.start).pop();
   check('после «Выполнить»: режим разработки, процесс с полным доступом', st().mode === 'dev' && Boolean(runStart) && runStart.start.includes('bypassPermissions') && !runStart.start.includes('plan'), runStart && runStart.start);
   check('в обычном режиме кнопки «Выполнить план» под ответом нет', !calls.slice(cP).some((x) => x.method === 'sendMessage' && JSON.stringify(x.payload.reply_markup || {}).includes('act:planrun')));
+
+  // ── копии бесед в чат ──
+  out('18. Копии бесед');
+  const projDir = path.join(env.CLAUDE_HOME, 'projects', '-opt-projects-demo');
+  fs.mkdirSync(projDir, { recursive: true });
+  fs.writeFileSync(path.join(projDir, 'aaa.jsonl'), '{"x":1}\n');
+  // время в проверках ускорено, а время файлов настоящее: задаём его по тем же часам, что и у бота
+  fs.utimesSync(path.join(projDir, 'aaa.jsonl'), new Date(Date.now() - 3600e3), new Date(Date.now() - 3600e3));
+  let cB = calls.length;
+  text('/backup');
+  await waitFor('полная копия', () => calls.slice(cB).some((x) => x.method === 'sendDocument'), 20000);
+  const docB = calls.slice(cB).find((x) => x.method === 'sendDocument');
+  check('первая копия — полная, файл .tar.gz с датой', /besedy-\d{4}-\d\d-\d\d_\d\d-\d\d-polnaya\.tar\.gz/.test(String(docB.raw)), String(docB.raw).slice(0, 300));
+  check('в подписи: «Копия бесед», «полная» и как восстановить', String(docB.raw).includes('Копия бесед') && String(docB.raw).includes('полная') && String(docB.raw).includes('tar xzf'));
+  fs.writeFileSync(path.join(projDir, 'bbb.jsonl'), '{"y":2}\n');
+  fs.utimesSync(path.join(projDir, 'bbb.jsonl'), new Date(Date.now() + 60e3), new Date(Date.now() + 60e3));
+  cB = calls.length;
+  text('/backup');
+  await waitFor('копия изменений', () => calls.slice(cB).some((x) => x.method === 'sendDocument'), 20000);
+  const docB2 = calls.slice(cB).find((x) => x.method === 'sendDocument');
+  check('вторая копия — только изменения, 1 файл', /izmeneniya\.tar\.gz/.test(String(docB2.raw)) && String(docB2.raw).includes('изменения: 1 файл'), String(docB2.raw).slice(0, 300));
+  const tarList = cp.execFileSync('tar', ['tzf', path.join(path.dirname(env.STATE_FILE), 'backups', fs.readdirSync(path.join(path.dirname(env.STATE_FILE), 'backups')).filter((f) => f.endsWith('izmeneniya.tar.gz')).pop())]).toString();
+  check('в архиве изменений есть новый файл и state.json, старого нет', tarList.includes('bbb.jsonl') && tarList.includes('state.json') && !tarList.includes('aaa.jsonl'), tarList);
 
   // ── остановка бота (systemctl restart): висящий переводчик не должен осиротеть ──
   timerSpeed = 1;             // таймауты настоящие: иначе зависший переводчик погиб бы сам раньше, чем бот получит сигнал
