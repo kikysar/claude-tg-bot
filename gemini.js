@@ -680,13 +680,29 @@ function createBridge(opts = {}) {
   /** Открыть поток у Vertex; 429 и 5xx пробуем ещё раз-два, вход обновляем при 401. */
   async function openUpstream(model, payload, ctl, method = 'streamGenerateContent') {
     const url = `${base}/v1/projects/${project}/locations/${location}/publishers/google/models/${model}:${method}${method === 'streamGenerateContent' ? '?alt=sse' : ''}`;
-    const body = Buffer.from(JSON.stringify(payload));
+    let body = Buffer.from(JSON.stringify(payload));
     const waits = opts.retryWaits || [1500, 4000];
+    let split = false;
     for (let i = 0; ; i++) {
       const tok = await auth.token();
       const r = await rawRequest(url, { method: 'POST', body, ctl, headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' } });
       if (r.status === 200) return r.res;
       const err = mapUpstreamError(r.status, await readAll(r.res));
+      if (r.status === 400 && /model turn/i.test(err.message || '') && !split) {
+        // Ход «ответ инструмента + реплика пользователя» (так выглядит сообщение после оборванной задачи) Vertex иногда
+        // читает как оканчивающийся ходом модели: отделяем реплику от ответа инструмента
+        const cs = payload.contents || [];
+        const last = cs[cs.length - 1];
+        if (last && last.role === 'user' && last.parts.some((x) => x.functionResponse) && last.parts.some((x) => x.text)) {
+          const fr = last.parts.filter((x) => !x.text), tx = last.parts.filter((x) => x.text);
+          split = true;
+          payload = { ...payload, contents: [...cs.slice(0, -1), { role: 'user', parts: fr },
+            { role: 'model', parts: [{ text: '(tool results received)' }] }, { role: 'user', parts: tx }] };
+          body = Buffer.from(JSON.stringify(payload));
+          log('WARN', 'Gemini: Vertex отверг ход «ответ инструмента + текст», повтор с разделением');
+          continue;
+        }
+      }
       if (r.status === 401 && i === 0) { auth.invalidate(); continue; }
       if (err.retryable && i < waits.length && !ctl.aborted) { await sleep(waits[i]); continue; }
       throw err;
